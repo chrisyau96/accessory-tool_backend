@@ -18,8 +18,9 @@ from flask_limiter.util import get_remote_address
 #   GITHUB_TOKEN           (required) read-only for data repo
 #   DATA_REPO              (default: chrisyau96/core-accessory-tool-data)
 #   DATA_PATH              (default: Accessory-Core-Master.xlsx)
+#   DATA_SHEET             (default: "") -> when set, read this sheet by name
 #   CACHE_TTL_SECONDS      (default: 1800)
-#   FRONTEND_ORIGINS       (csv) e.g. https://fortress-core-accessory-tool.netlify.app,https://core-accessory-tool.netlify.app
+#   FRONTEND_ORIGINS       (csv) e.g. https://www.fortress.com.hk,https://fortress.com.hk
 #   API_REFRESH_TOKEN      (required for /api/refresh)
 #   ENFORCE_ORIGIN         (default: true)
 #   MAX_ITEM_NAMES         (default: 200)
@@ -37,6 +38,7 @@ app = Flask(__name__)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
 DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
+DATA_SHEET = os.getenv("DATA_SHEET", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
 
 # CORS allowlist
@@ -86,17 +88,12 @@ def _origin_allowed() -> bool:
 
 @app.before_request
 def _block_unknown_origins():
-    # Always allow health
     if request.path == "/api/healthz":
         return
-
-    # Allow /api/refresh if a valid Bearer token is present (server→server call)
     if request.path == "/api/refresh":
         auth = request.headers.get("Authorization", "")
         if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
-            return  # skip origin check; view still validates token again
-
-    # Enforce Origin/Referer for all other API calls
+            return
     if request.path.startswith("/api/"):
         if not _origin_allowed():
             return jsonify({"error": "origin not allowed"}), 403
@@ -133,16 +130,13 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
       - Only keep rows where BUNDLE_TYPE in {"Compatible", "Consumable"}.
       - Create Item_str from Item (zero-padded 8-digit string) if Item exists.
     """
-    # Filter by BUNDLE_TYPE
     if "BUNDLE_TYPE" in df.columns:
         df = df[df["BUNDLE_TYPE"].isin(["Compatible", "Consumable"])].copy()
 
-    # Normalize Item_str (if Item column exists)
     if "Item" in df.columns:
         df["Item_str"] = (
             df["Item"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
         )
-
     return df
 
 def load_df(force: bool = False) -> pd.DataFrame:
@@ -150,7 +144,11 @@ def load_df(force: bool = False) -> pd.DataFrame:
     if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
         return _CACHE["df"]
     content = _fetch_excel_bytes_from_github()
-    df = pd.read_excel(BytesIO(content), engine="openpyxl")
+    # Read requested sheet if provided
+    read_kwargs = {"engine": "openpyxl"}
+    if DATA_SHEET:
+        read_kwargs["sheet_name"] = DATA_SHEET
+    df = pd.read_excel(BytesIO(content), **read_kwargs)
     df = _post_load_normalize(df)
     _CACHE.update({"df": df, "ts": now})
     return df
@@ -164,9 +162,14 @@ def extract_sku_from_url(url: str) -> str | None:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Payload building (remapped columns)
+#   Bundle Type        → BUNDLE_TYPE (filter to Compatible/Consumable)
+#   Bundle Group Name  → BUNDLE_ID
+#   Item Type          → ITEM_TYPE ("A"/"C")
+#   Department         → ITEM_DEPT_NAME
+#   Brand              → BRAND_NAME_EN
+#   Product name       → PRODUCT_NAME_EN
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_product_name(row: pd.Series) -> str:
-    # Always use PRODUCT_NAME_EN per new requirement
     return str(row.get("PRODUCT_NAME_EN", ""))
 
 def build_result(df: pd.DataFrame, product_number: str):
@@ -184,22 +187,16 @@ def build_result(df: pd.DataFrame, product_number: str):
     type_label = "Accessory" if item_type == "A" else "Core Item"
     bundle_group = row.get("BUNDLE_ID")
 
-    # Related = items in same bundle, opposite type
     related_df = pd.DataFrame()
     if ("BUNDLE_ID" in df.columns) and ("ITEM_TYPE" in df.columns) and pd.notna(bundle_group):
         opposite_type = "C" if item_type == "A" else "A"
         related_df = df[(df["BUNDLE_ID"] == bundle_group) & (df["ITEM_TYPE"] == opposite_type)].copy()
-
-        # Deduplicate by product name
         if "PRODUCT_NAME_EN" in related_df.columns:
             related_df = related_df.drop_duplicates(subset=["PRODUCT_NAME_EN"])
-
-        # Sort by RRP then name if present
         sort_cols = [c for c in ["RRP", "PRODUCT_NAME_EN"] if c in related_df.columns]
         if sort_cols:
             related_df = related_df.sort_values(by=sort_cols)
 
-    # Build main result (keep outward JSON keys stable for FE)
     allow_val = row.get("Allow To Buy")
     try:
         allow_to_buy = int(allow_val) == 1
@@ -208,8 +205,8 @@ def build_result(df: pd.DataFrame, product_number: str):
 
     result = {
         "item": product_number,
-        "item_name_retek": _get_product_name(row),  # keep key for FE, value now PRODUCT_NAME_EN
-        "item_name": _get_product_name(row),        # fallback key for FE, same value
+        "item_name_retek": _get_product_name(row),
+        "item_name": _get_product_name(row),
         "brand": str(row.get("BRAND_NAME_EN", "")),
         "department": str(row.get("ITEM_DEPT_NAME", "")),
         "item_type": str(item_type),
@@ -218,16 +215,13 @@ def build_result(df: pd.DataFrame, product_number: str):
         "allow_to_buy": 1 if allow_to_buy else 0,
     }
 
-    # Related list (preserve outward field names)
-    out_cols = ["ITEM_DEPT_NAME", "BRAND_NAME_EN", "PRODUCT_NAME_EN", "RRP", "Item_str", "Allow To Buy"]
     related_items = []
     if not related_df.empty:
         if "Item_str" not in related_df.columns and "Item" in related_df.columns:
             related_df["Item_str"] = (
                 related_df["Item"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
             )
-        subset = related_df.reindex(columns=[c for c in out_cols if c != "Item_str"] + ["Item_str"], fill_value="")
-        for _, r in subset.iterrows():
+        for _, r in related_df.iterrows():
             allow = r.get("Allow To Buy")
             try:
                 allow_flag = int(allow) == 1
@@ -238,8 +232,8 @@ def build_result(df: pd.DataFrame, product_number: str):
                 {
                     "Department": str(r.get("ITEM_DEPT_NAME", "")),
                     "Brand": str(r.get("BRAND_NAME_EN", "")),
-                    "Item Name (retek)": str(r.get("PRODUCT_NAME_EN", "")),  # keep FE key, mapped value
-                    "Item Name": str(r.get("PRODUCT_NAME_EN", "")),          # keep FE key, mapped value
+                    "Item Name (retek)": str(r.get("PRODUCT_NAME_EN", "")),
+                    "Item Name": str(r.get("PRODUCT_NAME_EN", "")),
                     "RRP": (float(r["RRP"]) if pd.notna(r.get("RRP", None)) else None),
                     "Item": str(r.get("Item_str", "")),
                     "Allow To Buy": 1 if allow_flag else 0,
@@ -258,10 +252,6 @@ def health():
 @limiter.limit(os.getenv("RATE_LIMIT_META", "30/minute;1000/day"))
 @app.get("/api/meta")
 def api_meta():
-    """
-    ?type=A|C&department=<name>&brand=<name>
-    Returns types, departments, brands; item_names only when all 3 filters provided (capped).
-    """
     df = load_df()
     q_type = request.args.get("type", "").strip()
     q_dept = request.args.get("department", "").strip()
@@ -284,18 +274,13 @@ def api_meta():
     item_names = []
     if name_col and q_type and q_dept and q_brand:
         item_names = pd.Series(filtered[name_col]).dropna().astype(str).unique().tolist()
-        item_names = sorted(item_names)[:MAX_ITEM_NAMES]  # cap to reduce enumeration
+        item_names = sorted(item_names)[:MAX_ITEM_NAMES]
 
     return jsonify({"types": types, "departments": departments, "brands": brands, "item_names": item_names})
 
 @limiter.limit(os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day"))
 @app.get("/api/suggest")
 def api_suggest():
-    """
-    Suggest item names by token-prefix match.
-    Query: ?q=<text>&type=&department=&brand=
-    Returns: {"suggestions": [...]}
-    """
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"suggestions": []})
@@ -331,12 +316,6 @@ def api_suggest():
 @limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
 def api_search():
-    """
-    { action: "dropdown"|"link"|"number",
-      selected_item_name?: string,      # PRODUCT_NAME_EN
-      product_link?: string,
-      product_number?: string }
-    """
     payload = request.get_json(force=True, silent=True) or {}
     action = (payload.get("action") or "").strip()
 
