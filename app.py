@@ -149,16 +149,32 @@ def _ensure_item_str(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
         )
     return df, sku_col
 
+def _build_display_name(brand: str, pname_en: str) -> str:
+    """
+    DISPLAY_NAME = BRAND_NAME_EN + ' ' + PRODUCT_NAME_EN,
+    but if PRODUCT_NAME_EN already starts with BRAND_NAME_EN (case-insensitive),
+    just return PRODUCT_NAME_EN (no duplication).
+    """
+    b = (brand or "").strip()
+    p = (pname_en or "").strip()
+    if not b:
+        return p
+    if not p:
+        return b
+    # If p already starts with brand (e.g., "3M KJ455F-6 Air Cleaner"), keep p
+    if p.lower().startswith(b.lower() + " " ) or p.lower() == b.lower():
+        return p
+    return f"{b} {p}".strip()
+
 def _ensure_display_name(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    DISPLAY_NAME = BRAND_NAME_EN + ' ' + PRODUCT_NAME_EN
-    """
-    brand = df.get("BRAND_NAME_EN")
-    pname_en = df.get("PRODUCT_NAME_EN")
-    if brand is not None or pname_en is not None:
-        b = brand.fillna("").astype(str) if brand is not None else ""
-        p = pname_en.fillna("").astype(str) if pname_en is not None else ""
-        df["DISPLAY_NAME"] = (b.str.strip() + " " + p.str.strip()).str.strip()
+    b = df.get("BRAND_NAME_EN")
+    p = df.get("PRODUCT_NAME_EN")
+    if b is not None or p is not None:
+        brand = b.fillna("").astype(str) if b is not None else ""
+        pname = p.fillna("").astype(str) if p is not None else ""
+        df["DISPLAY_NAME"] = [
+            _build_display_name(brand.iloc[i], pname.iloc[i]) for i in range(len(df))
+        ]
     else:
         df["DISPLAY_NAME"] = ""
     return df
