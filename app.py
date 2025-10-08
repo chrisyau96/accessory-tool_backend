@@ -164,15 +164,7 @@ def extract_sku_from_url(url: str) -> str | None:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Payload building (remapped columns)
-#   AS-IS                 → TO-BE
-#   Bundle Type           → BUNDLE_TYPE (filter to Compatible/Consumable)
-#   Bundle Group Name     → BUNDLE_ID
-#   Item Type             → ITEM_TYPE (values assumed "A" or "C")
-#   Department            → ITEM_DEPT_NAME
-#   Brand                 → BRAND_NAME_EN
-#   Item Name(s)          → PRODUCT_NAME_EN (for display & selection)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _get_product_name(row: pd.Series) -> str:
     # Always use PRODUCT_NAME_EN per new requirement
     return str(row.get("PRODUCT_NAME_EN", ""))
@@ -269,12 +261,6 @@ def api_meta():
     """
     ?type=A|C&department=<name>&brand=<name>
     Returns types, departments, brands; item_names only when all 3 filters provided (capped).
-    Uses new columns:
-      type -> ITEM_TYPE
-      department -> ITEM_DEPT_NAME
-      brand -> BRAND_NAME_EN
-      product names -> PRODUCT_NAME_EN
-    Only rows where BUNDLE_TYPE in {Compatible, Consumable} are considered.
     """
     df = load_df()
     q_type = request.args.get("type", "").strip()
@@ -308,9 +294,7 @@ def api_suggest():
     """
     Suggest item names by token-prefix match.
     Query: ?q=<text>&type=&department=&brand=
-    Returns: {"suggestions": ["Dyson HS08 Hairwrap", ...]}
-    Uses PRODUCT_NAME_EN for names and new filter columns.
-    Only rows where BUNDLE_TYPE in {Compatible, Consumable} are considered.
+    Returns: {"suggestions": [...]}
     """
     q = (request.args.get("q") or "").strip()
     if not q:
@@ -318,7 +302,6 @@ def api_suggest():
     ql = q.lower()
 
     df = load_df()
-    # Optional filters, if caller provides them
     q_type = request.args.get("type", "").strip()
     q_dept = request.args.get("department", "").strip()
     q_brand = request.args.get("brand", "").strip()
@@ -388,7 +371,6 @@ def api_search():
                 error = "Please enter a valid product link."
 
     elif action == "number":
-        # Kept for backward compatibility (UI no longer uses it)
         if NUMBER_SEARCH_DELAY_MS > 0:
             time.sleep(NUMBER_SEARCH_DELAY_MS / 1000.0)
         num = (payload.get("product_number") or "").strip()
@@ -424,6 +406,5 @@ def _ratelimit_handler(e):
 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
