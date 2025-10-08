@@ -16,12 +16,11 @@ from flask_limiter.util import get_remote_address
 # ──────────────────────────────────────────────────────────────────────────────
 # Env (Railway):
 #   GITHUB_TOKEN           (required) read-only for data repo
-#   DATA_REPO              (default: chrisyau96/accessory-tool_data)
+#   DATA_REPO              (default: chrisyau96/core-accessory-tool-data)
 #   DATA_PATH              (default: Accessory-Core-Master.xlsx)
-#   DATA_SHEET             (optional) e.g. Export Worksheet
-#   SKU_COLUMN             (optional) the exact column name holding the SKU
+#   DATA_SHEET             (optional, e.g. "Export Worksheet")
 #   CACHE_TTL_SECONDS      (default: 1800)
-#   FRONTEND_ORIGINS       (csv) e.g. https://www.fortress.com.hk,https://fortress.com.hk
+#   FRONTEND_ORIGINS       (csv) e.g. https://www.fortress.com.hk
 #   API_REFRESH_TOKEN      (required for /api/refresh)
 #   ENFORCE_ORIGIN         (default: true)
 #   MAX_ITEM_NAMES         (default: 200)
@@ -37,16 +36,15 @@ from flask_limiter.util import get_remote_address
 app = Flask(__name__)
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/accessory-tool_data")
+DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
 DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
-DATA_SHEET = os.getenv("DATA_SHEET", "").strip()
-SKU_COLUMN = os.getenv("SKU_COLUMN", "").strip()
+DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
 
 # CORS allowlist
 _frontend_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
 if not _frontend_origins:
-    CORS(app)  # permissive only for first run; set FRONTEND_ORIGINS in prod
+    CORS(app)  # permissive for first run; set FRONTEND_ORIGINS in prod
 else:
     CORS(app, resources={r"/api/*": {"origins": _frontend_origins}})
 
@@ -90,17 +88,12 @@ def _origin_allowed() -> bool:
 
 @app.before_request
 def _block_unknown_origins():
-    # Always allow health
     if request.path == "/api/healthz":
         return
-
-    # Allow /api/refresh if a valid Bearer token is present (server→server call)
     if request.path == "/api/refresh":
         auth = request.headers.get("Authorization", "")
         if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
-            return  # skip origin check
-
-    # Enforce Origin/Referer for all other API calls
+            return
     if request.path.startswith("/api/"):
         if not _origin_allowed():
             return jsonify({"error": "origin not allowed"}), 403
@@ -115,8 +108,21 @@ def _security_headers(resp):
     resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
 
+# Column utilities (support upper/title variants)
+def _get_series(row, *names):
+    for n in names:
+        if n in row:
+            return row.get(n)
+    return None
+
+def _get_col(df, *names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Data access & normalization
+# Data access
 # ──────────────────────────────────────────────────────────────────────────────
 def _fetch_excel_bytes_from_github() -> bytes:
     if not GITHUB_TOKEN:
@@ -125,67 +131,23 @@ def _fetch_excel_bytes_from_github() -> bytes:
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3.raw",
-        "User-Agent": "accessory-tool",
+        "User-Agent": "core-accessory-tool",
     }
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
 
-def _find_sku_col(df: pd.DataFrame) -> str | None:
-    candidates = []
-    if SKU_COLUMN:
-        candidates.append(SKU_COLUMN)
-    candidates += ["Item", "ITEM", "ITEM_NO", "ITEM_NUMBER", "ITEM_CODE", "SKU", "PRODUCT_NO"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-def _ensure_item_str(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
-    sku_col = _find_sku_col(df)
-    if sku_col:
-        df["Item_str"] = (
-            df[sku_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
-        )
-    return df, sku_col
-
-def _build_display_name(brand: str, pname_en: str) -> str:
-    """
-    DISPLAY_NAME = BRAND_NAME_EN + ' ' + PRODUCT_NAME_EN,
-    but if PRODUCT_NAME_EN already starts with BRAND_NAME_EN (case-insensitive),
-    just return PRODUCT_NAME_EN (no duplication).
-    """
-    b = (brand or "").strip()
-    p = (pname_en or "").strip()
-    if not b:
-        return p
-    if not p:
-        return b
-    # If p already starts with brand (e.g., "3M KJ455F-6 Air Cleaner"), keep p
-    if p.lower().startswith(b.lower() + " " ) or p.lower() == b.lower():
-        return p
-    return f"{b} {p}".strip()
-
-def _ensure_display_name(df: pd.DataFrame) -> pd.DataFrame:
-    b = df.get("BRAND_NAME_EN")
-    p = df.get("PRODUCT_NAME_EN")
-    if b is not None or p is not None:
-        brand = b.fillna("").astype(str) if b is not None else ""
-        pname = p.fillna("").astype(str) if p is not None else ""
-        df["DISPLAY_NAME"] = [
-            _build_display_name(brand.iloc[i], pname.iloc[i]) for i in range(len(df))
-        ]
-    else:
-        df["DISPLAY_NAME"] = ""
-    return df
-
 def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
-    # Keep only rows where BUNDLE_TYPE is Compatible / Consumable
+    # Keep only Compatible / Consumable
     if "BUNDLE_TYPE" in df.columns:
         df = df[df["BUNDLE_TYPE"].isin(["Compatible", "Consumable"])].copy()
-    # Build helper columns we rely on
-    df, _ = _ensure_item_str(df)
-    df = _ensure_display_name(df)
+
+    # Build Item_str from ITEM or Item
+    item_col = _get_col(df, "ITEM", "Item")
+    if item_col:
+        df["Item_str"] = (
+            df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+        )
     return df
 
 def load_df(force: bool = False) -> pd.DataFrame:
@@ -193,17 +155,16 @@ def load_df(force: bool = False) -> pd.DataFrame:
     if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
         return _CACHE["df"]
     content = _fetch_excel_bytes_from_github()
-    read_kwargs = {"engine": "openpyxl"}
     if DATA_SHEET:
-        read_kwargs["sheet_name"] = DATA_SHEET
-    df = pd.read_excel(BytesIO(content), **read_kwargs)
+        df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
+    else:
+        df = pd.read_excel(BytesIO(content), engine="openpyxl")
+    # Normalize column names (trim spaces)
+    df.columns = [str(c).strip() for c in df.columns]
     df = _post_load_normalize(df)
     _CACHE.update({"df": df, "ts": now})
     return df
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Search helpers
-# ──────────────────────────────────────────────────────────────────────────────
 def extract_sku_from_url(url: str) -> str | None:
     for p in (r"variant=(\d{8})", r"/p/(\d{8})", r"/p/BP_(\d{8})"):
         m = re.search(p, url)
@@ -211,79 +172,164 @@ def extract_sku_from_url(url: str) -> str | None:
             return m.group(1)
     return None
 
-def _get_display_name(row: pd.Series) -> str:
-    return str(row.get("DISPLAY_NAME", "")).strip()
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Payload building
+# Language helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def build_result(df: pd.DataFrame, product_number: str):
-    df, _ = _ensure_item_str(df)
-    match = df[df["Item_str"] == product_number]
-    if match.empty:
-        return None, None, f"Product {product_number} not found."
+LANG_BRAND_MAP = {
+    "en": "BRAND_NAME_EN",
+    "tc": "BRAND_NAME_TC",
+    "sc": "BRAND_NAME_SC",
+}
+LANG_PRODUCT_MAP = {
+    "en": "PRODUCT_NAME_EN",
+    "tc": "PRODUCT_NAME_TC",
+    "sc": "PRODUCT_NAME_SC",
+}
 
-    row = match.iloc[0]
-    item_type = row.get("ITEM_TYPE")
-    type_label = "Accessory" if item_type == "A" else "Core Item"
-    bundle_group = row.get("BUNDLE_ID")
+def _norm_lang(s: str | None) -> str:
+    s = (s or "en").lower()
+    return "tc" if s == "zh-hk" else "sc" if s == "zh-cn" else ("en" if s not in ("en","tc","sc") else s)
 
-    # Related = items in same bundle, opposite type
-    related_df = pd.DataFrame()
-    if ("BUNDLE_ID" in df.columns) and ("ITEM_TYPE" in df.columns) and pd.notna(bundle_group):
-        opposite_type = "C" if item_type == "A" else "A"
-        related_df = df[(df["BUNDLE_ID"] == bundle_group) & (df["ITEM_TYPE"] == opposite_type)].copy()
-        if "DISPLAY_NAME" in related_df.columns:
-            related_df = related_df.drop_duplicates(subset=["DISPLAY_NAME"])
-        sort_cols = [c for c in ["RRP", "DISPLAY_NAME"] if c in related_df.columns]
-        if sort_cols:
-            related_df = related_df.sort_values(by=sort_cols)
+def _cap_words_en(brand: str) -> str:
+    if not brand: return brand
+    # title-case words, leave all-non-ascii untouched
+    if re.search(r"[^\x00-\x7F]", brand):  # contains non-ascii
+        return brand
+    return re.sub(r"[A-Za-z]+", lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), brand)
 
-    # Build main result
-    allow_val = row.get("ALLOW_TO_BUY")
+def _display_name(brand: str, product: str, lang: str) -> str:
+    b = (brand or "").strip()
+    p = (product or "").strip()
+    if not b and not p:
+        return ""
+    # EN: case-insensitive check + brand capitalization for display
+    if lang == "en":
+        b_disp = _cap_words_en(b)
+        if p.lower().startswith(b.lower() + " "):
+            return b_disp + p[len(b):]  # keep product tail as-is
+        if p.lower() == b.lower():
+            return b_disp
+        return f"{b_disp} {p}".strip()
+    # TC/SC: exact startswith check; no capitalization
+    if p.startswith(b + " "):
+        return b + p[len(b):]
+    if p == b:
+        return b
+    return f"{b} {p}".strip()
+
+def _brand_for_display(brand: str, lang: str) -> str:
+    return _cap_words_en(brand) if lang == "en" else (brand or "")
+
+def _allow_to_buy_val(val) -> int:
     try:
-        allow_to_buy = int(allow_val) == 1
+        return 1 if int(val) == 1 else 0
     except Exception:
-        allow_to_buy = str(allow_val).strip() == "1"
+        return 1 if str(val).strip() == "1" else 0
 
-    display_name = _get_display_name(row)
+# ──────────────────────────────────────────────────────────────────────────────
+# Build result payloads (language-aware)
+# ──────────────────────────────────────────────────────────────────────────────
+def _select_cols(df: pd.DataFrame, lang: str):
+    brand_col = LANG_BRAND_MAP[lang]
+    product_col = LANG_PRODUCT_MAP[lang]
+    item_col = _get_col(df, "ITEM", "Item")
+    dept_col = "ITEM_DEPT_NAME"
+    type_col = "ITEM_TYPE"
+    bundle_col = "BUNDLE_ID"
+    allow_col = _get_col(df, "ALLOW_TO_BUY", "Allow To Buy")
+    rrp_col = "RRP" if "RRP" in df.columns else None
+    return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
 
-    result = {
-        "item": product_number,
-        "item_name_retek": display_name,   # keep FE keys; value now DISPLAY_NAME
-        "item_name": display_name,
-        "brand": str(row.get("BRAND_NAME_EN", "")),
-        "department": str(row.get("ITEM_DEPT_NAME", "")),
-        "item_type": str(item_type),
+def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    if not (brand_col and product_col):
+        return pd.DataFrame()
+    # compute display names and match
+    tmp = df[[c for c in [brand_col, product_col] if c in df.columns]].copy()
+    tmp["_disp"] = [
+        _display_name(b, p, lang)
+        for b, p in zip(tmp.get(brand_col, ""), tmp.get(product_col, ""))
+    ]
+    return df[tmp["_disp"] == name]
+
+def _row_to_result(row: pd.Series, lang: str) -> dict:
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
+    brand_raw = str(_get_series(row, brand_col) or "")
+    product_raw = str(_get_series(row, product_col) or "")
+    dept = str(_get_series(row, dept_col) or "")
+    item_type = str(_get_series(row, type_col) or "")
+    type_label = "Accessory" if item_type == "A" else "Core Item"
+    item = str(_get_series(row, "Item_str") or "")
+    allow = _allow_to_buy_val(_get_series(row, allow_col) if allow_col else None)
+    rrp = None
+    rrp_cell = _get_series(row, "RRP")
+    if rrp_cell is not None and pd.notna(rrp_cell):
+        try:
+            rrp = float(rrp_cell)
+        except Exception:
+            rrp = None
+
+    # display values
+    brand_disp = _brand_for_display(brand_raw, lang)
+    item_name_disp = _display_name(brand_raw, product_raw, lang)
+
+    return {
+        "item": item,
+        "item_name_retek": item_name_disp,   # keep FE key; value already formatted
+        "item_name": item_name_disp,         # fallback
+        "brand": brand_disp,                 # display-ready
+        "department": dept,                  # unchanged (no localization provided)
+        "item_type": item_type,
         "type_label": type_label,
-        "rrp": (float(row["RRP"]) if "RRP" in row and pd.notna(row["RRP"]) else None),
-        "allow_to_buy": 1 if allow_to_buy else 0,
+        "rrp": rrp,
+        "allow_to_buy": allow,
     }
 
-    # Related list
-    related_items = []
-    if not related_df.empty:
-        related_df, _ = _ensure_item_str(related_df)
-        for _, r in related_df.iterrows():
-            allow = r.get("ALLOW_TO_BUY")
+def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    if not (bundle_col and type_col) or pd.isna(row.get(bundle_col)):
+        return []
+
+    opposite_type = "C" if row.get(type_col) == "A" else "A"
+    rel = df[(df[bundle_col] == row.get(bundle_col)) & (df[type_col] == opposite_type)].copy()
+
+    # Drop duplicates by (brand+product) display name
+    rel["_disp"] = [
+        _display_name(str(r.get(brand_col, "")), str(r.get(product_col, "")), lang) for _, r in rel.iterrows()
+    ]
+    rel = rel.drop_duplicates(subset=["_disp"])
+
+    # Sort by RRP then name if present
+    sort_cols = [c for c in ["RRP", "_disp"] if c in rel.columns]
+    if sort_cols:
+        rel = rel.sort_values(by=sort_cols)
+
+    # Ensure Item_str present
+    if "Item_str" not in rel.columns and item_col in rel.columns:
+        rel["Item_str"] = (
+            rel[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+        )
+
+    out = []
+    for _, r in rel.iterrows():
+        allow = _allow_to_buy_val(r.get(allow_col) if allow_col else None)
+        rrp_val = None
+        if "RRP" in r and pd.notna(r["RRP"]):
             try:
-                allow_flag = int(allow) == 1
+                rrp_val = float(r["RRP"])
             except Exception:
-                allow_flag = str(allow).strip() == "1"
+                rrp_val = None
 
-            related_items.append(
-                {
-                    "Department": str(r.get("ITEM_DEPT_NAME", "")),
-                    "Brand": str(r.get("BRAND_NAME_EN", "")),
-                    "Item Name (retek)": str(r.get("DISPLAY_NAME", "")),
-                    "Item Name": str(r.get("DISPLAY_NAME", "")),
-                    "RRP": (float(r["RRP"]) if pd.notna(r.get("RRP", None)) else None),
-                    "Item": str(r.get("Item_str", "")),
-                    "Allow To Buy": 1 if allow_flag else 0,
-                }
-            )
-
-    return result, related_items, None
+        out.append({
+            "Department": str(r.get(dept_col, "")),
+            "Brand": _brand_for_display(str(r.get(brand_col, "")), lang),
+            "Item Name (retek)": str(r.get("_disp", "")),
+            "Item Name": str(r.get("_disp", "")),
+            "RRP": rrp_val,
+            "Item": str(r.get("Item_str", "")),
+            "Allow To Buy": 1 if allow else 0,
+        })
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -296,33 +342,40 @@ def health():
 @app.get("/api/meta")
 def api_meta():
     """
-    ?type=A|C&department=<name>&brand=<name>
-    Returns types, departments, brands; item_names only when all 3 filters provided (capped).
-    Uses DISPLAY_NAME for item names.
+    ?type=A|C&department=<name>&brand=<name>&lang=en|tc|sc
+    Returns:
+      - types: ["A","C"]
+      - departments: [ITEM_DEPT_NAME]
+      - brands: [BRAND_NAME_* (raw values)]
+      - item_names: [display names] only when all 3 filters provided (capped)
     """
     df = load_df()
-    q_type = request.args.get("type", "").strip()
-    q_dept = request.args.get("department", "").strip()
-    q_brand = request.args.get("brand", "").strip()
+    lang = _norm_lang(request.args.get("lang"))
+    q_type = (request.args.get("type") or "").strip()
+    q_dept = (request.args.get("department") or "").strip()
+    q_brand = (request.args.get("brand") or "").strip()
+
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
-    if q_type and "ITEM_TYPE" in filtered.columns:
-        filtered = filtered[filtered["ITEM_TYPE"] == q_type]
-    if q_dept and "ITEM_DEPT_NAME" in filtered.columns:
-        filtered = filtered[filtered["ITEM_DEPT_NAME"] == q_dept]
-    if q_brand and "BRAND_NAME_EN" in filtered.columns:
-        filtered = filtered[filtered["BRAND_NAME_EN"] == q_brand]
+    if q_type and type_col in filtered.columns:
+        filtered = filtered[filtered[type_col] == q_type]
+    if q_dept and dept_col in filtered.columns:
+        filtered = filtered[filtered[dept_col] == q_dept]
+    if q_brand and brand_col in filtered.columns:
+        filtered = filtered[filtered[brand_col] == q_brand]
 
-    name_col = "DISPLAY_NAME" if "DISPLAY_NAME" in filtered.columns else None
-
-    types = sorted(df["ITEM_TYPE"].dropna().unique().tolist()) if "ITEM_TYPE" in df.columns else []
-    departments = sorted(filtered["ITEM_DEPT_NAME"].dropna().unique().tolist()) if "ITEM_DEPT_NAME" in filtered.columns else []
-    brands = sorted(filtered["BRAND_NAME_EN"].dropna().unique().tolist()) if "BRAND_NAME_EN" in filtered.columns else []
+    types = sorted(df[type_col].dropna().unique().tolist()) if type_col in df.columns else []
+    departments = sorted(filtered[dept_col].dropna().astype(str).unique().tolist()) if dept_col in filtered.columns else []
+    brands = sorted(filtered[brand_col].dropna().astype(str).unique().tolist()) if brand_col in filtered.columns else []
 
     item_names = []
-    if name_col and q_type and q_dept and q_brand:
-        item_names = pd.Series(filtered[name_col]).dropna().astype(str).unique().tolist()
-        item_names = sorted(item_names)[:MAX_ITEM_NAMES]  # cap to reduce enumeration
+    if brand_col and product_col and q_type and q_dept and q_brand:
+        disp = [
+            _display_name(str(b), str(p), lang)
+            for b, p in zip(filtered.get(brand_col, []), filtered.get(product_col, []))
+        ]
+        item_names = sorted(pd.Series(disp).dropna().astype(str).unique().tolist())[:MAX_ITEM_NAMES]
 
     return jsonify({"types": types, "departments": departments, "brands": brands, "item_names": item_names})
 
@@ -330,8 +383,8 @@ def api_meta():
 @app.get("/api/suggest")
 def api_suggest():
     """
-    Suggest item names by token-prefix match on DISPLAY_NAME.
-    Optional filters: type, department, brand.
+    Suggest item display names (language-aware).
+    Query: ?q=<text>&type=&department=&brand=&lang=en|tc|sc
     """
     q = (request.args.get("q") or "").strip()
     if not q:
@@ -339,28 +392,35 @@ def api_suggest():
     ql = q.lower()
 
     df = load_df()
-    q_type = request.args.get("type", "").strip()
-    q_dept = request.args.get("department", "").strip()
-    q_brand = request.args.get("brand", "").strip()
+    lang = _norm_lang(request.args.get("lang"))
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+
+    # Optional filters
+    q_type = (request.args.get("type") or "").strip()
+    q_dept = (request.args.get("department") or "").strip()
+    q_brand = (request.args.get("brand") or "").strip()
 
     filtered = df.copy()
-    if q_type and "ITEM_TYPE" in filtered.columns:
-        filtered = filtered[filtered["ITEM_TYPE"] == q_type]
-    if q_dept and "ITEM_DEPT_NAME" in filtered.columns:
-        filtered = filtered[filtered["ITEM_DEPT_NAME"] == q_dept]
-    if q_brand and "BRAND_NAME_EN" in filtered.columns:
-        filtered = filtered[filtered["BRAND_NAME_EN"] == q_brand]
+    if q_type and type_col in filtered.columns:
+        filtered = filtered[filtered[type_col] == q_type]
+    if q_dept and dept_col in filtered.columns:
+        filtered = filtered[filtered[dept_col] == q_dept]
+    if q_brand and brand_col in filtered.columns:
+        filtered = filtered[filtered[brand_col] == q_brand]
 
-    name_col = "DISPLAY_NAME" if "DISPLAY_NAME" in filtered.columns else None
-    if not name_col:
+    if not (brand_col and product_col):
         return jsonify({"suggestions": []})
 
-    names = pd.Series(filtered[name_col]).dropna().astype(str).unique().tolist()
+    names = [
+        _display_name(str(b), str(p), lang)
+        for b, p in zip(filtered.get(brand_col, []), filtered.get(product_col, []))
+    ]
+    names = pd.Series(names).dropna().astype(str).unique().tolist()
 
-    # allow English + CJK token starts
     def token_prefix_match(name: str) -> bool:
-        tokens = re.split(r"[^A-Za-z0-9\u4e00-\u9fff]+", name.lower())
-        return any(t.startswith(ql) for t in tokens if t)
+        # simple token/character prefix match works for EN/TC/SC
+        tokens = re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", name.lower())
+        return any(t.startswith(ql.lower()) for t in tokens if t)
 
     matched = [n for n in names if token_prefix_match(n)]
     matched = sorted(matched)[:MAX_SUGGESTIONS]
@@ -371,12 +431,15 @@ def api_suggest():
 def api_search():
     """
     { action: "dropdown"|"link"|"number",
-      selected_item_name?: string,      # DISPLAY_NAME
+      selected_item_name?: string,  # display name, from API/meta/suggest for given lang
       product_link?: string,
-      product_number?: string }
+      product_number?: string,
+      lang?: "en"|"tc"|"sc"
+    }
     """
     payload = request.get_json(force=True, silent=True) or {}
     action = (payload.get("action") or "").strip()
+    lang = _norm_lang(payload.get("lang"))
 
     df = load_df()
     product_number = None
@@ -387,19 +450,13 @@ def api_search():
         if not name:
             error = "Please select the product."
         else:
-            if "DISPLAY_NAME" in df.columns:
-                match = df[df["DISPLAY_NAME"] == name]
-            else:
-                match = pd.DataFrame()
+            match = _match_by_display_name(df, name, lang)
             if match.empty:
                 error = "No match found for the selected product."
             else:
-                sku_col = _find_sku_col(df)
-                if not sku_col:
-                    error = "SKU column not found in data."
-                else:
-                    sku = str(match.iloc[0].get(sku_col, "")).replace(".0", "")
-                    product_number = sku.zfill(8)
+                item_col = _get_col(match, "ITEM", "Item")
+                sku_raw = str(match.iloc[0].get(item_col, "")).replace(".0", "") if item_col else ""
+                product_number = sku_raw.zfill(8)
 
     elif action == "link":
         link = (payload.get("product_link") or "").strip()
@@ -420,17 +477,26 @@ def api_search():
             error = "Please enter an 8-digit product number."
         else:
             product_number = num
-
     else:
         error = "Invalid action."
 
     if error:
         return jsonify({"error": error}), 400
 
-    result, related, err = build_result(df, product_number)
-    if err:
-        return jsonify({"error": err}), 404
+    # Build result by product_number
+    if "Item_str" not in df.columns:
+        item_col = _get_col(df, "ITEM", "Item")
+        if item_col:
+            df["Item_str"] = (
+                df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+            )
+    match = df[df["Item_str"] == product_number]
+    if match.empty:
+        return jsonify({"error": f"Product {product_number} not found."}), 404
 
+    row = match.iloc[0]
+    result = _row_to_result(row, lang)
+    related = _related_items(df, row, lang)
     return jsonify({"result": result, "related_items": related})
 
 @limiter.limit(os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day"))
