@@ -229,15 +229,27 @@ def _allow_to_buy_val(val) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 # Build result payloads (language-aware)
 # ──────────────────────────────────────────────────────────────────────────────
-def _select_cols(df: pd.DataFrame, lang: str):
-    brand_col = LANG_BRAND_MAP[lang]
-    product_col = LANG_PRODUCT_MAP[lang]
-    item_col = _get_col(df, "ITEM", "Item")
-    dept_col = "ITEM_DEPT_NAME"
-    type_col = "ITEM_TYPE"
-    bundle_col = "BUNDLE_ID"
-    allow_col = _get_col(df, "ALLOW_TO_BUY", "Allow To Buy")
-    rrp_col = "RRP" if "RRP" in df.columns else None
+def _select_cols(df_like, lang: str):
+    """
+    Works with both DataFrame (df.columns) and Series (row.index).
+    Returns a tuple of column names (or None if not present).
+    """
+    cols = set()
+    if hasattr(df_like, "columns"):
+        cols = set(map(str, df_like.columns))
+    elif hasattr(df_like, "index"):
+        cols = set(map(str, df_like.index))
+
+    def has(c): return c in cols
+
+    brand_col = LANG_BRAND_MAP[lang] if has(LANG_BRAND_MAP[lang]) else None
+    product_col = LANG_PRODUCT_MAP[lang] if has(LANG_PRODUCT_MAP[lang]) else None
+    item_col = "ITEM" if has("ITEM") else ("Item" if has("Item") else None)
+    dept_col = "ITEM_DEPT_NAME" if has("ITEM_DEPT_NAME") else None
+    type_col = "ITEM_TYPE" if has("ITEM_TYPE") else None
+    bundle_col = "BUNDLE_ID" if has("BUNDLE_ID") else None
+    allow_col = "ALLOW_TO_BUY" if has("ALLOW_TO_BUY") else ("Allow To Buy" if has("Allow To Buy") else None)
+    rrp_col = "RRP" if has("RRP") else None
     return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
 
 def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
