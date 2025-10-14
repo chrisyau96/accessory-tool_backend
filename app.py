@@ -17,8 +17,14 @@ app = Flask(__name__)
 # ── Config / Env ─────────────────────────────────────────────────────────────
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
+
+# Master dataset (original)
 DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
 DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
+
+# NEW: Department mapping dataset
+DEPT_MAP_PATH = os.getenv("DEPT_MAP_PATH", "mapping.xlsx")
+
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
 
 _frontend_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
@@ -30,6 +36,7 @@ else:
 limiter = Limiter(key_func=get_remote_address, default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")])
 limiter.init_app(app)
 
+# Cache holds the merged DataFrame (master + mapping)
 _CACHE = {"df": None, "ts": 0}
 
 ENFORCE_ORIGIN = os.getenv("ENFORCE_ORIGIN", "true").lower() == "true"
@@ -96,10 +103,10 @@ def _get_col(df, *names):
     return None
 
 # ── Data access ──────────────────────────────────────────────────────────────
-def _fetch_excel_bytes_from_github() -> bytes:
+def _fetch_excel_bytes_from_github_path(path: str) -> bytes:
     if not GITHUB_TOKEN:
         raise RuntimeError("Server missing GITHUB_TOKEN")
-    url = f"https://api.github.com/repos/{DATA_REPO}/contents/{DATA_PATH}"
+    url = f"https://api.github.com/repos/{DATA_REPO}/contents/{path}"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3.raw",
@@ -110,8 +117,10 @@ def _fetch_excel_bytes_from_github() -> bytes:
     return r.content
 
 def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
+    # Filter bundles if present
     if "BUNDLE_TYPE" in df.columns:
         df = df[df["BUNDLE_TYPE"].isin(["Compatible", "Consumable"])].copy()
+    # String SKU padded to 8 digits
     item_col = _get_col(df, "ITEM", "Item")
     if item_col:
         df["Item_str"] = (
@@ -119,17 +128,44 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
         )
     return df
 
+def _load_dept_mapping() -> pd.DataFrame:
+    """
+    Returns columns:
+      ITEM_DEPT_NAME, ITEM_DEPT_NAME_EN, ITEM_DEPT_NAME_TC, ITEM_DEPT_NAME_SC
+    """
+    try:
+        content = _fetch_excel_bytes_from_github_path(DEPT_MAP_PATH)
+        dfm = pd.read_excel(BytesIO(content), engine="openpyxl")
+    except Exception:
+        dfm = pd.DataFrame()
+
+    dfm.columns = [str(c).strip() for c in dfm.columns]
+    for c in ["ITEM_DEPT_NAME","ITEM_DEPT_NAME_EN","ITEM_DEPT_NAME_TC","ITEM_DEPT_NAME_SC"]:
+        if c not in dfm.columns:
+            dfm[c] = ""
+    dfm["ITEM_DEPT_NAME"] = dfm["ITEM_DEPT_NAME"].astype(str).str.strip()
+    return dfm
+
 def load_df(force: bool = False) -> pd.DataFrame:
     now = time.time()
     if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
         return _CACHE["df"]
-    content = _fetch_excel_bytes_from_github()
+
+    # Load master
+    content = _fetch_excel_bytes_from_github_path(DATA_PATH)
     if DATA_SHEET:
         df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
     else:
         df = pd.read_excel(BytesIO(content), engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     df = _post_load_normalize(df)
+
+    # Merge department mapping on ITEM_DEPT_NAME
+    df_map = _load_dept_mapping()
+    if "ITEM_DEPT_NAME" in df.columns and not df_map.empty:
+        df["ITEM_DEPT_NAME"] = df["ITEM_DEPT_NAME"].astype(str).str.strip()
+        df = df.merge(df_map, on="ITEM_DEPT_NAME", how="left")
+
     _CACHE.update({"df": df, "ts": now})
     return df
 
@@ -160,7 +196,7 @@ def _safe_str(v) -> str:
     return str(v)
 
 def _cap_words_en(brand: str) -> str:
-    if not brand: 
+    if not brand:
         return brand
     if re.search(r"[^\x00-\x7F]", brand):
         return brand
@@ -195,6 +231,17 @@ def _allow_to_buy_val(val) -> int:
         return 1 if int(val) == 1 else 0
     except Exception:
         return 1 if str(val).strip() == "1" else 0
+
+def _dept_label(row_like, lang: str) -> str:
+    """
+    row_like: Series or DataFrame row with mapping columns
+    """
+    col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+    # try localized, fallback raw
+    lbl = _safe_str(row_like.get(col)) if hasattr(row_like, "get") else ""
+    if lbl:
+        return lbl
+    return _safe_str(row_like.get("ITEM_DEPT_NAME")) if hasattr(row_like, "get") else ""
 
 # ── Column selection usable for DataFrame *or* Series ────────────────────────
 def _select_cols(df_like, lang: str):
@@ -232,7 +279,9 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
     brand_raw = _safe_str(_get_series(row, brand_col))
     product_raw = _safe_str(_get_series(row, product_col))
-    dept = _safe_str(_get_series(row, dept_col))
+    dept_raw = _safe_str(_get_series(row, dept_col))
+    dept_disp = _dept_label(row, lang)  # localized label
+
     item_type = _safe_str(_get_series(row, type_col))
     type_label = "Accessory" if item_type == "A" else "Core Item"
     item = _safe_str(_get_series(row, "Item_str"))
@@ -254,7 +303,8 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
         "item_name_retek": item_name_disp,
         "item_name": item_name_disp,
         "brand": brand_disp,
-        "department": dept,
+        "department": dept_disp,       # localized
+        "department_raw": dept_raw,    # raw (handy if needed)
         "item_type": item_type,
         "type_label": type_label,
         "rrp": rrp,
@@ -295,7 +345,7 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
                 rrp_val = None
 
         out.append({
-            "Department": _safe_str(r.get(dept_col, "")),
+            "Department": _dept_label(r, lang),  # localized
             "Brand": _brand_for_display(_safe_str(r.get(brand_col, "")), lang),
             "Item Name (retek)": _safe_str(r.get("_disp", "")),
             "Item Name": _safe_str(r.get("_disp", "")),
@@ -316,7 +366,7 @@ def api_meta():
     df = load_df()
     lang = _norm_lang(request.args.get("lang"))
     q_type = (request.args.get("type") or "").strip()
-    q_dept = (request.args.get("department") or "").strip()
+    q_dept = (request.args.get("department") or "").strip()  # RAW value expected
     q_brand = (request.args.get("brand") or "").strip()
 
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
@@ -325,12 +375,25 @@ def api_meta():
     if q_type and type_col in filtered.columns:
         filtered = filtered[filtered[type_col] == q_type]
     if q_dept and dept_col in filtered.columns:
-        filtered = filtered[filtered[dept_col] == q_dept]
+        filtered = filtered[filtered[dept_col] == q_dept]   # filter by RAW
     if q_brand and brand_col in filtered.columns:
         filtered = filtered[filtered[brand_col] == q_brand]
 
     types = sorted(df[type_col].dropna().unique().tolist()) if type_col in df.columns else []
-    departments = sorted(filtered[dept_col].dropna().astype(str).unique().tolist()) if dept_col in filtered.columns else []
+
+    # departments: as [{value,label}] using merged mapping columns
+    departments = []
+    if dept_col in filtered.columns:
+        dept_raws = sorted(filtered[dept_col].dropna().astype(str).unique().tolist())
+        label_col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+        lab_map = {}
+        if label_col in df.columns and dept_col in df.columns:
+            pairs = df[[dept_col, label_col]].dropna().astype({dept_col: str})
+            lab_map = dict(zip(pairs[dept_col], pairs[label_col].fillna("").astype(str)))
+        for raw in dept_raws:
+            label = lab_map.get(raw) or raw
+            departments.append({"value": raw, "label": label})
+
     brands = sorted(filtered[brand_col].dropna().astype(str).unique().tolist()) if brand_col in filtered.columns else []
 
     item_names = []
