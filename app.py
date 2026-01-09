@@ -1,69 +1,38 @@
 import os
 import re
+import time
+import threading
+from io import BytesIO
 from urllib.parse import urlparse
 
 import requests
+from openpyxl import load_workbook
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+
 app = Flask(__name__)
 
-# ── Config / Env ─────────────────────────────────────────────────────────────
-BACKEND_BASE_URL = os.getenv(
-    "BACKEND_BASE_URL",
-    "http://10.32.34.119/check_accessory_tool"
-).rstrip("/")
-
+# ── CORS / Origin allowlist ──────────────────────────────────────────────────
 _frontend_origins = [
     o.strip()
     for o in os.getenv("FRONTEND_ORIGINS", "").split(",")
     if o.strip()
 ]
+
 if not _frontend_origins:
     CORS(app)
 else:
     CORS(app, resources={r"/api/*": {"origins": _frontend_origins}})
 
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")]
-)
-limiter.init_app(app)
-
 ENFORCE_ORIGIN = os.getenv("ENFORCE_ORIGIN", "true").lower() == "true"
 ALLOWED_ORIGINS = {o.lower() for o in _frontend_origins}
+
 API_REFRESH_TOKEN = os.getenv("API_REFRESH_TOKEN", "")
 
-# ── Rate limit configs ───────────────────────────────────────────────────────
-RATE_LIMIT_META = os.getenv("RATE_LIMIT_META", "30/minute;1000/day")
-RATE_LIMIT_SUGGEST = os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day")
-RATE_LIMIT_SEARCH = os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day")
-RATE_LIMIT_REFRESH = os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day")
-
-# ── Broad-match tuning ───────────────────────────────────────────────────────
-# Applies local broad-match filtering + ranking on top of upstream responses.
-SUGGEST_BROAD_MATCH = os.getenv("SUGGEST_BROAD_MATCH", "true").lower() == "true"
-SEARCH_BROAD_MATCH = os.getenv("SEARCH_BROAD_MATCH", str(SUGGEST_BROAD_MATCH)).lower() == "true"
-
-# If upstream returns fewer than this, we will fan out to additional upstream queries (variants)
-BROAD_MATCH_FALLBACK_MIN_RESULTS = int(os.getenv("BROAD_MATCH_FALLBACK_MIN_RESULTS", "1"))
-
-# Total upstream calls per request: 1 (original) + (max_calls-1) variants
-BROAD_MATCH_MAX_UPSTREAM_CALLS = int(os.getenv("BROAD_MATCH_MAX_UPSTREAM_CALLS", "4"))
-
-# Cap merged candidates after de-dupe (helps keep response small / predictable)
-BROAD_MATCH_MAX_MERGED_RESULTS = int(os.getenv("BROAD_MATCH_MAX_MERGED_RESULTS", "50"))
-
-# Always re-rank results for suggest so "more parts matched => higher in list"
-SUGGEST_RERANK_ALWAYS = os.getenv("SUGGEST_RERANK_ALWAYS", "true").lower() == "true"
-SEARCH_RERANK_ALWAYS = os.getenv("SEARCH_RERANK_ALWAYS", "false").lower() == "true"
-
-BROAD_MATCH_TIMEOUT_SEC = int(os.getenv("BROAD_MATCH_TIMEOUT_SEC", "30"))
-
-# ── Security / Origins ───────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
     try:
         p = urlparse(value)
@@ -76,22 +45,31 @@ def _normalize_origin(value: str) -> str:
 def _origin_allowed() -> bool:
     if not ENFORCE_ORIGIN or not ALLOWED_ORIGINS:
         return True
+
     origin = request.headers.get("Origin", "")
     ref = request.headers.get("Referer", "")
+
+    # Browser fetch sends Origin for cross-origin calls
     if origin:
         return _normalize_origin(origin) in ALLOWED_ORIGINS
     if ref:
         return _normalize_origin(ref) in ALLOWED_ORIGINS
+
+    # If no Origin/Referer, block only if you want to be strict.
+    # For SmartEdit / browsers, you should normally get Origin.
     return False
 
 @app.before_request
 def _block_unknown_origins():
     if request.path == "/api/healthz":
         return
+
+    # allow refresh with bearer token even if origin is not present
     if request.path == "/api/refresh":
         auth = request.headers.get("Authorization", "")
         if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
             return
+
     if request.path.startswith("/api/"):
         if not _origin_allowed():
             return jsonify({"error": "origin not allowed"}), 403
@@ -110,472 +88,260 @@ def _security_headers(resp):
     )
     return resp
 
-# ── Upstream proxy helpers ───────────────────────────────────────────────────
-def _upstream_url(path: str) -> str:
-    return f"{BACKEND_BASE_URL}{path}"
+# ── Rate limiting ────────────────────────────────────────────────────────────
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")]
+)
+limiter.init_app(app)
 
-def _forward_headers() -> dict:
-    headers = {}
-    if "Authorization" in request.headers:
-        headers["Authorization"] = request.headers["Authorization"]
-    return headers
+RATE_LIMIT_META = os.getenv("RATE_LIMIT_META", "30/minute;1000/day")
+RATE_LIMIT_SUGGEST = os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day")
+RATE_LIMIT_SEARCH = os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day")
+RATE_LIMIT_REFRESH = os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day")
 
-def _proxy_upstream(method: str):
-    url = _upstream_url(request.path)
-    headers = _forward_headers()
+# ── GitHub data source config ────────────────────────────────────────────────
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+DATA_REPO = os.getenv("DATA_REPO", "")          # "owner/repo"
+DATA_PATH = os.getenv("DATA_PATH", "")          # "file.xlsx" or "folder/file.xlsx"
+DATA_SHEET = os.getenv("DATA_SHEET", "")        # "Export Worksheet"
+DATA_REF = os.getenv("DATA_REF", "main")        # branch/tag/commit
 
-    try:
-        if method.upper() == "GET":
-            upstream_resp = requests.get(
-                url,
-                params=request.args,
-                headers=headers,
-                timeout=BROAD_MATCH_TIMEOUT_SEC,
-            )
-        else:
-            json_body = request.get_json(force=False, silent=True)
-            upstream_resp = requests.request(
-                method.upper(),
-                url,
-                params=request.args,
-                json=json_body,
-                headers=headers,
-                timeout=BROAD_MATCH_TIMEOUT_SEC,
-            )
-    except requests.RequestException:
-        return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
+DATA_CACHE_TTL_SEC = int(os.getenv("DATA_CACHE_TTL_SEC", "600"))  # 10 min
 
-    resp = make_response(upstream_resp.content, upstream_resp.status_code)
-    content_type = upstream_resp.headers.get("Content-Type")
-    if content_type:
-        resp.headers["Content-Type"] = content_type
-    return resp
+SUGGEST_LIMIT = int(os.getenv("SUGGEST_LIMIT", "20"))
 
-# ── Broad-match helpers ──────────────────────────────────────────────────────
-def _extract_list_container(payload):
+# ── In-memory cache ──────────────────────────────────────────────────────────
+_lock = threading.Lock()
+_cache = {
+    "loaded_at": 0.0,
+    "rows": [],
+    "by_sku": {},          # sku -> row
+    "by_label": {},        # label_lower -> row
+    "by_core": {},         # core_sku -> [rows] (accessories)
+    "last_error": "",
+}
+
+def _gh_headers_raw():
+    if not GITHUB_TOKEN:
+        return {}
+    # Fine-grained tokens work with Bearer; classic PAT also works
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.raw",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "accessory-tool-backend",
+    }
+
+def _download_excel_bytes() -> bytes:
+    if not (DATA_REPO and DATA_PATH and GITHUB_TOKEN):
+        raise RuntimeError("Missing DATA_REPO / DATA_PATH / GITHUB_TOKEN")
+
+    # This endpoint returns RAW bytes when Accept: application/vnd.github.raw is used
+    url = f"https://api.github.com/repos/{DATA_REPO}/contents/{DATA_PATH}"
+    params = {"ref": DATA_REF} if DATA_REF else None
+
+    r = requests.get(url, headers=_gh_headers_raw(), params=params, timeout=30)
+    if r.status_code == 404:
+        raise RuntimeError("GitHub file not found (check DATA_REPO/DATA_PATH/DATA_REF)")
+    if r.status_code == 401 or r.status_code == 403:
+        raise RuntimeError("GitHub unauthorized/forbidden (check token permissions)")
+    r.raise_for_status()
+    return r.content
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+def _pick_col(headers_norm: list[str], candidates: list[str]) -> int | None:
     """
-    Returns (items_list, wrap_fn) where wrap_fn(new_items) returns same payload shape.
-    Supports:
-      - list payload
-      - dict payload with items under common keys
+    Find a column index by matching normalized header names.
+    candidates should already be normalized-like (we normalize inside).
     """
-    if isinstance(payload, list):
-        return payload, (lambda new_items: new_items)
+    cand = {_norm(x) for x in candidates}
+    for i, h in enumerate(headers_norm):
+        if h in cand:
+            return i
+    return None
 
-    if isinstance(payload, dict):
-        for k in ("suggestions", "results", "items", "data"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                def _wrap(new_items, _k=k, _p=payload):
-                    out = dict(_p)
-                    out[_k] = new_items
-                    return out
-                return v, _wrap
-
-    return None, None
-
-def _tokenize_query(q: str):
+def _tokenize(q: str) -> list[str]:
     q = (q or "").strip().lower()
-    # Split on whitespace and punctuation-ish, keep alnum chunks
-    tokens = re.findall(r"[a-z0-9]+", q)
-    # de-dup while keeping order
+    toks = re.findall(r"[a-z0-9]+", q)
+    # de-dup keep order
     seen = set()
     out = []
-    for t in tokens:
+    for t in toks:
         if t and t not in seen:
             seen.add(t)
             out.append(t)
     return out
 
-def _item_text(it) -> str:
-    if not isinstance(it, dict):
-        return str(it).lower()
-
-    parts = []
-    for key in (
-        "name", "itemName", "item_name", "productName", "product_name",
-        "title", "displayName", "display_name",
-        "brand", "brandName", "brand_name",
-        "model", "modelNo", "model_no",
-        "code", "sku", "id"
-    ):
-        val = it.get(key)
-        if isinstance(val, str) and val.strip():
-            parts.append(val.strip().lower())
-
-    # Fallback: include any string values
-    if not parts:
-        for v in it.values():
-            if isinstance(v, str) and v.strip():
-                parts.append(v.strip().lower())
-
-    return " ".join(parts)
-
-def _token_match(haystack: str, tok: str) -> bool:
-    if not tok:
-        return False
-    # Keep very-short tokens from overmatching too aggressively
-    if len(tok) <= 2:
-        return re.search(rf"\b{re.escape(tok)}\b", haystack) is not None
-    return tok in haystack
-
-def _word_boundary_at(text: str, pos: int) -> bool:
-    return pos == 0 or (pos > 0 and not text[pos - 1].isalnum())
-
-def _word_boundary_after(text: str, end: int) -> bool:
-    return end >= len(text) or (end < len(text) and not text[end].isalnum())
-
-def _match_stats(text: str, tokens: list[str], raw_q: str):
+def _score(text: str, tokens: list[str]) -> tuple[int, int]:
     """
-    Returns:
-      matched_count: int
-      quality_score: int (higher is better)
-    Primary sort is matched_count (more parts matched => higher rank).
+    Sort key: (matched_token_count, quality)
+    More tokens matched => higher rank, as you requested.
     """
-    if not tokens:
-        return 0, 0
-
-    matched_positions = []
+    t = text.lower()
+    matched = 0
     quality = 0
-    matched_count = 0
-
-    for t in tokens:
-        pos = text.find(t)
+    for tok in tokens:
+        pos = t.find(tok)
         if pos == -1:
             continue
-        matched_count += 1
-        end = pos + len(t)
-
-        # Base points for matching this token; longer tokens are more valuable
-        quality += 20 + min(len(t), 10)
-
-        # Better if token aligns to word boundaries / starts
-        if _word_boundary_at(text, pos):
-            quality += 10
-        if _word_boundary_at(text, pos) and _word_boundary_after(text, end):
-            quality += 6  # full-word match
-
-        # Earlier matches slightly better
+        matched += 1
+        quality += 10 + min(len(tok), 10)
         if pos == 0:
-            quality += 6
-        elif pos < 15:
             quality += 3
-        elif pos < 40:
+        elif pos < 20:
             quality += 1
+    return matched, quality
 
-        matched_positions.append(pos)
+def _build_label(brand: str, name: str, sku: str) -> str:
+    brand = str(brand or "").strip()
+    name = str(name or "").strip()
+    sku = str(sku or "").strip()
 
-    # Phrase/sequence bonus (helps "hx9991 toothbrush" rank above just "hx9991")
-    condensed = " ".join(_tokenize_query(raw_q))
-    if condensed and condensed in text:
-        quality += 35
-
-    # Tokens appearing in order
-    if len(matched_positions) >= 2 and matched_positions == sorted(matched_positions):
-        quality += 10
-
-    return matched_count, quality
-
-def _item_key(it):
-    if isinstance(it, dict):
-        for k in ("sku", "code", "id", "value"):
-            v = it.get(k)
-            if isinstance(v, (str, int)) and str(v).strip():
-                return f"{k}:{str(v).strip()}"
-    return f"repr:{repr(it)}"
-
-def _dedup_keep_order(items: list):
-    out = []
-    seen = set()
-    for it in items:
-        k = _item_key(it)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(it)
-    return out
-
-def _guess_query_key_from_args():
-    # prefer whatever the caller actually used
-    for k in ("q", "query", "term"):
-        if request.args.get(k):
-            return k
-    return "q"
-
-def _guess_query_key_from_body(body: dict):
-    for k in ("q", "query", "term"):
-        v = body.get(k)
-        if isinstance(v, str):
-            return k
-    return "q"
-
-def _variants_from_token(t: str):
-    """
-    Generate broader query variants to get a larger candidate pool from upstream.
-    Example: 'hx9991' -> ['hx9991', 'hx', 'hx999', 'hx99', 'hx9', '9991']
-             'phili'  -> ['phili', 'phil', 'phi']
-    """
-    t = (t or "").strip().lower()
-    if not t:
-        return []
-
-    variants = [t]
-
-    letters = "".join(re.findall(r"[a-z]+", t))
-    digits = "".join(re.findall(r"[0-9]+", t))
-
-    # Useful for model numbers like hx9991 -> hx
-    if letters and letters != t:
-        variants.append(letters)
-
-    if digits and digits != t:
-        variants.append(digits)
-
-    # Prefixes (broader). Keep >= 3 usually, but allow 2 for things like 'hx'.
-    for n in (6, 5, 4, 3, 2):
-        if len(t) > n:
-            variants.append(t[:n])
-
-    if letters:
-        for n in (4, 3, 2):
-            if len(letters) > n:
-                variants.append(letters[:n])
-
-    # de-dup preserve order
-    out = []
-    seen = set()
-    for v in variants:
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-def _build_upstream_query_variants(raw_q: str):
-    """
-    Build a short list of upstream query strings to try (in order),
-    excluding the original raw_q (which is always tried first).
-    """
-    tokens = _tokenize_query(raw_q)
-    if not tokens:
-        return []
-
-    # Try longer tokens first (they usually narrow the candidate pool in a useful way)
-    tokens_sorted = sorted(tokens, key=len, reverse=True)
-
-    variants = []
-    for t in tokens_sorted:
-        variants.extend(_variants_from_token(t))
-
-    # de-dup, remove exact original normalized duplicates
-    raw_norm = (raw_q or "").strip().lower()
-    out = []
-    seen = set()
-    for v in variants:
-        if not v:
-            continue
-        if v == raw_norm:
-            continue
-        if v in seen:
-            continue
-        seen.add(v)
-        out.append(v)
-
-    return out
-
-def _call_upstream_get(url: str, headers: dict, args: dict):
-    try:
-        return requests.get(url, params=args, headers=headers, timeout=BROAD_MATCH_TIMEOUT_SEC)
-    except requests.RequestException:
-        return None
-
-def _call_upstream_post(url: str, headers: dict, args: dict, body: dict):
-    try:
-        return requests.post(url, params=args, json=body, headers=headers, timeout=BROAD_MATCH_TIMEOUT_SEC)
-    except requests.RequestException:
-        return None
-
-def _broad_match_response_for_get(always_rerank: bool):
-    """
-    Broad match for GET endpoints (/api/suggest):
-      - Try upstream with original query
-      - If too few, fan out to variant upstream queries to gather candidates
-      - Locally rank so: more tokens matched => higher rank
-    """
-    q_key = _guess_query_key_from_args()
-    raw_q = request.args.get(q_key, "") or ""
-    tokens = _tokenize_query(raw_q)
-
-    # If no query, just proxy
-    if not raw_q.strip():
-        return _proxy_upstream("GET")
-
-    url = _upstream_url(request.path)
-    headers = _forward_headers()
-
-    # 1) Original upstream call
-    upstream_full = _call_upstream_get(url, headers, request.args)
-    if upstream_full is None:
-        return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
-
-    # If upstream is not JSON, pass-through
-    try:
-        payload_full = upstream_full.json()
-    except Exception:
-        resp = make_response(upstream_full.content, upstream_full.status_code)
-        ct = upstream_full.headers.get("Content-Type")
-        if ct:
-            resp.headers["Content-Type"] = ct
-        return resp
-
-    items_full, wrap_full = _extract_list_container(payload_full)
-    if items_full is None or not isinstance(items_full, list):
-        return jsonify(payload_full), upstream_full.status_code
-
-    # Start candidate pool with what we already have
-    candidates = list(items_full)
-
-    # 2) If too few results, gather more candidates using upstream variants
-    if SUGGEST_BROAD_MATCH and (len(items_full) < BROAD_MATCH_FALLBACK_MIN_RESULTS):
-        variants = _build_upstream_query_variants(raw_q)
-        max_extra_calls = max(0, BROAD_MATCH_MAX_UPSTREAM_CALLS - 1)
-
-        # Keep original args, just change q param
-        base_args = request.args.to_dict(flat=True)
-
-        calls = 0
-        for v in variants:
-            if calls >= max_extra_calls:
-                break
-            args2 = dict(base_args)
-            args2[q_key] = v
-            r = _call_upstream_get(url, headers, args2)
-            if r is None:
-                continue
-            try:
-                payload_v = r.json()
-            except Exception:
-                continue
-            items_v, _wrap_v = _extract_list_container(payload_v)
-            if isinstance(items_v, list) and items_v:
-                candidates.extend(items_v)
-                calls += 1
-
-    candidates = _dedup_keep_order(candidates)
-
-    # 3) Local broad-match filter + rank
-    # Keep anything that matches at least 1 token; rank by matched token count then quality.
-    if (SUGGEST_BROAD_MATCH or always_rerank) and tokens:
-        scored = []
-        for it in candidates:
-            text = _item_text(it)
-            matched_count, quality = _match_stats(text, tokens, raw_q)
-            if matched_count >= 1:
-                scored.append((matched_count, quality, it))
-
-        # If nothing matched locally, fall back to upstream as-is
-        if scored:
-            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            ranked = [it for _, __, it in scored]
+    if brand and name:
+        # avoid "brand brand ..."
+        if _norm(name).startswith(_norm(brand)):
+            label = name
         else:
-            ranked = items_full
+            label = f"{brand} {name}"
     else:
-        ranked = items_full
+        label = name or brand or sku
 
-    if BROAD_MATCH_MAX_MERGED_RESULTS > 0:
-        ranked = ranked[:BROAD_MATCH_MAX_MERGED_RESULTS]
+    return label.strip()
 
-    out_payload = wrap_full(ranked) if wrap_full else ranked
-    return jsonify(out_payload), upstream_full.status_code
+def _load_excel_into_cache(force: bool = False):
+    with _lock:
+        now = time.time()
+        if not force and _cache["rows"] and (now - _cache["loaded_at"] < DATA_CACHE_TTL_SEC):
+            return
 
-def _broad_match_response_for_post(always_rerank: bool):
-    """
-    Broad match for POST endpoints (/api/search) if enabled:
-      - Try upstream with original body
-      - If too few, fan out to variant upstream queries to gather candidates
-      - Locally rank so: more tokens matched => higher rank
-    """
-    body = request.get_json(force=False, silent=True)
-    if not isinstance(body, dict):
-        return _proxy_upstream("POST")
+        try:
+            b = _download_excel_bytes()
+            wb = load_workbook(filename=BytesIO(b), read_only=True, data_only=True)
 
-    q_key = _guess_query_key_from_body(body)
-    raw_q = body.get(q_key) if isinstance(body.get(q_key), str) else ""
-    tokens = _tokenize_query(raw_q)
+            sheet_name = DATA_SHEET if DATA_SHEET in wb.sheetnames else wb.sheetnames[0]
+            ws = wb[sheet_name]
 
-    # If no query, just proxy
-    if not (raw_q or "").strip():
-        return _proxy_upstream("POST")
+            # read header row
+            rows_iter = ws.iter_rows(values_only=True)
+            header = next(rows_iter, None)
+            if not header:
+                raise RuntimeError("Excel sheet has no header row")
 
-    url = _upstream_url(request.path)
-    headers = _forward_headers()
+            headers = [str(h or "").strip() for h in header]
+            headers_norm = [_norm(h) for h in headers]
 
-    # 1) Original upstream call
-    upstream_full = _call_upstream_post(url, headers, request.args, body)
-    if upstream_full is None:
-        return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
+            # Common column name candidates (adjust if your Excel uses different headers)
+            idx_sku = _pick_col(headers_norm, ["Item", "SKU", "Item No", "item", "item_no", "product_number"])
+            idx_brand = _pick_col(headers_norm, ["Brand", "brand"])
+            idx_dept = _pick_col(headers_norm, ["Department", "department", "Category", "category"])
+            idx_name = _pick_col(headers_norm, ["Item Name (retek)", "item_name_retek", "Item Name", "item_name", "Product Name"])
+            idx_type = _pick_col(headers_norm, ["item_type", "Item Type", "Type", "type"])
+            idx_rrp = _pick_col(headers_norm, ["RRP", "rrp"])
+            idx_allow = _pick_col(headers_norm, ["Allow To Buy", "AllowToBuy", "allow_to_buy"])
 
-    try:
-        payload_full = upstream_full.json()
-    except Exception:
-        resp = make_response(upstream_full.content, upstream_full.status_code)
-        ct = upstream_full.headers.get("Content-Type")
-        if ct:
-            resp.headers["Content-Type"] = ct
-        return resp
+            # Optional "core link" column (if your sheet has it)
+            idx_core = _pick_col(headers_norm, ["Core Item", "core_item", "Parent Item", "parent_item", "Main Item", "main_item", "Core SKU", "core_sku"])
 
-    items_full, wrap_full = _extract_list_container(payload_full)
-    if items_full is None or not isinstance(items_full, list):
-        return jsonify(payload_full), upstream_full.status_code
+            data_rows = []
+            by_sku = {}
+            by_label = {}
+            by_core = {}
 
-    candidates = list(items_full)
+            for r in rows_iter:
+                # skip empty rows
+                if not r or all(v is None or str(v).strip() == "" for v in r):
+                    continue
 
-    # 2) If too few results, gather more via variant queries
-    if SEARCH_BROAD_MATCH and (len(items_full) < BROAD_MATCH_FALLBACK_MIN_RESULTS):
-        variants = _build_upstream_query_variants(raw_q)
-        max_extra_calls = max(0, BROAD_MATCH_MAX_UPSTREAM_CALLS - 1)
+                def get(i):
+                    if i is None:
+                        return ""
+                    if i >= len(r):
+                        return ""
+                    v = r[i]
+                    return "" if v is None else str(v).strip()
 
-        calls = 0
-        for v in variants:
-            if calls >= max_extra_calls:
-                break
-            body2 = dict(body)
-            body2[q_key] = v
-            r = _call_upstream_post(url, headers, request.args, body2)
-            if r is None:
-                continue
-            try:
-                payload_v = r.json()
-            except Exception:
-                continue
-            items_v, _wrap_v = _extract_list_container(payload_v)
-            if isinstance(items_v, list) and items_v:
-                candidates.extend(items_v)
-                calls += 1
+                sku = get(idx_sku)
+                brand = get(idx_brand)
+                dept = get(idx_dept)
+                name = get(idx_name)
+                itype = get(idx_type)
+                rrp = get(idx_rrp)
+                allow = get(idx_allow)
+                core = get(idx_core)
 
-    candidates = _dedup_keep_order(candidates)
+                label = _build_label(brand, name, sku)
 
-    # 3) Local broad-match filter + rank
-    if (SEARCH_BROAD_MATCH or always_rerank) and tokens:
-        scored = []
-        for it in candidates:
-            text = _item_text(it)
-            matched_count, quality = _match_stats(text, tokens, raw_q)
-            if matched_count >= 1:
-                scored.append((matched_count, quality, it))
+                row_obj = {
+                    "_sku": sku,
+                    "_brand": brand,
+                    "_dept": dept,
+                    "_name": name,
+                    "_type": itype,
+                    "_rrp": rrp,
+                    "_allow": allow,
+                    "_core": core,
+                    "_label": label,
+                    "_search": _norm(f"{sku} {brand} {name} {dept} {itype} {core} {label}"),
+                }
+                data_rows.append(row_obj)
 
-        if scored:
-            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            ranked = [it for _, __, it in scored]
-        else:
-            ranked = items_full
-    else:
-        ranked = items_full
+                if sku:
+                    by_sku[sku] = row_obj
+                if label:
+                    by_label[_norm(label)] = row_obj
 
-    if BROAD_MATCH_MAX_MERGED_RESULTS > 0:
-        ranked = ranked[:BROAD_MATCH_MAX_MERGED_RESULTS]
+                # if accessory rows point to a core SKU, index them
+                if core:
+                    by_core.setdefault(core, []).append(row_obj)
 
-    out_payload = wrap_full(ranked) if wrap_full else ranked
-    return jsonify(out_payload), upstream_full.status_code
+            _cache["rows"] = data_rows
+            _cache["by_sku"] = by_sku
+            _cache["by_label"] = by_label
+            _cache["by_core"] = by_core
+            _cache["loaded_at"] = time.time()
+            _cache["last_error"] = ""
+
+        except Exception as e:
+            _cache["last_error"] = str(e)
+            # Keep old cache if it exists, so service still works with last good data
+            if not _cache["rows"]:
+                raise
+
+def _ensure_data_loaded():
+    _load_excel_into_cache(force=False)
+
+def _result_payload(row_obj):
+    # keys that your frontend already knows how to read
+    return {
+        "department": row_obj.get("_dept", ""),
+        "brand": row_obj.get("_brand", ""),
+        "item_name_retek": row_obj.get("_label", "") or row_obj.get("_name", ""),
+        "item_type": row_obj.get("_type", ""),
+        "rrp": row_obj.get("_rrp", ""),
+        "allow_to_buy": row_obj.get("_allow", ""),
+        "item": row_obj.get("_sku", ""),
+    }
+
+def _related_payload(row_obj):
+    return {
+        "Department": row_obj.get("_dept", ""),
+        "Brand": row_obj.get("_brand", ""),
+        "Item Name (retek)": row_obj.get("_label", "") or row_obj.get("_name", ""),
+        "RRP": row_obj.get("_rrp", ""),
+        "Allow To Buy": row_obj.get("_allow", ""),
+        "Item": row_obj.get("_sku", ""),
+    }
+
+def _is_core(row_obj) -> bool:
+    t = (row_obj.get("_type") or "").strip().lower()
+    return t.startswith("c") or "core" in t
+
+def _is_accessory(row_obj) -> bool:
+    t = (row_obj.get("_type") or "").strip().lower()
+    return t.startswith("a") or "access" in t
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/api/healthz")
@@ -585,25 +351,148 @@ def health():
 @limiter.limit(RATE_LIMIT_META)
 @app.get("/api/meta")
 def api_meta():
-    return _proxy_upstream("GET")
+    try:
+        _ensure_data_loaded()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "repo": DATA_REPO,
+            "path": DATA_PATH,
+            "sheet": DATA_SHEET,
+        }, 500
+
+    return {
+        "ok": True,
+        "loaded_at": _cache["loaded_at"],
+        "row_count": len(_cache["rows"]),
+        "repo": DATA_REPO,
+        "path": DATA_PATH,
+        "sheet": DATA_SHEET,
+        "ref": DATA_REF,
+        "last_error": _cache["last_error"],
+    }
 
 @limiter.limit(RATE_LIMIT_SUGGEST)
 @app.get("/api/suggest")
 def api_suggest():
-    # Broad-match + ranking:
-    # - single-token searches like "phili" or "hx999" now also benefit
-    # - multi-token searches like "hx9991 toothbrush" rank higher when more tokens match
-    if not SUGGEST_BROAD_MATCH and not SUGGEST_RERANK_ALWAYS:
-        return _proxy_upstream("GET")
-    return _broad_match_response_for_get(always_rerank=SUGGEST_RERANK_ALWAYS)
+    q = request.args.get("q", "") or request.args.get("query", "") or request.args.get("term", "")
+    q = (q or "").strip()
+    if not q:
+        return {"suggestions": []}
+
+    try:
+        _ensure_data_loaded()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    tokens = _tokenize(q)
+    if not tokens:
+        return {"suggestions": []}
+
+    scored = []
+    for r in _cache["rows"]:
+        matched, quality = _score(r["_search"], tokens)
+        if matched >= 1:
+            scored.append((matched, quality, r["_label"]))
+
+    # more parts matched => higher rank
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    out = []
+    seen = set()
+    for _, __, label in scored:
+        key = _norm(label)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+        if len(out) >= SUGGEST_LIMIT:
+            break
+
+    return {"suggestions": out}
 
 @limiter.limit(RATE_LIMIT_SEARCH)
 @app.post("/api/search")
 def api_search():
-    # Optional broad-match for search (POST). Enable with SEARCH_BROAD_MATCH=true
-    if not SEARCH_BROAD_MATCH and not SEARCH_RERANK_ALWAYS:
-        return _proxy_upstream("POST")
-    return _broad_match_response_for_post(always_rerank=SEARCH_RERANK_ALWAYS)
+    body = request.get_json(force=False, silent=True) or {}
+    action = (body.get("action") or "").strip().lower()
+
+    try:
+        _ensure_data_loaded()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    def find_by_sku(sku: str):
+        return _cache["by_sku"].get(str(sku or "").strip())
+
+    def find_by_label(label: str):
+        return _cache["by_label"].get(_norm(label or ""))
+
+    # --- resolve "selected" row ---
+    selected = None
+
+    if action == "number":
+        selected = find_by_sku(body.get("product_number"))
+
+    elif action == "link":
+        link = str(body.get("product_link") or "")
+        m = re.search(r"(\d{8})", link)
+        if m:
+            selected = find_by_sku(m.group(1))
+
+    elif action == "dropdown":
+        selected = find_by_label(body.get("selected_item_name"))
+        # fallback: broad match if label not found
+        if not selected:
+            q = str(body.get("selected_item_name") or "")
+            tokens = _tokenize(q)
+            best = None
+            for r in _cache["rows"]:
+                matched, quality = _score(r["_search"], tokens)
+                if matched < 1:
+                    continue
+                cand = (matched, quality, r)
+                if best is None or (cand[0], cand[1]) > (best[0], best[1]):
+                    best = cand
+            selected = best[2] if best else None
+
+    else:
+        # generic text search
+        q = str(body.get("q") or body.get("query") or body.get("term") or "")
+        tokens = _tokenize(q)
+        best = None
+        for r in _cache["rows"]:
+            matched, quality = _score(r["_search"], tokens)
+            if matched < 1:
+                continue
+            cand = (matched, quality, r)
+            if best is None or (cand[0], cand[1]) > (best[0], best[1]):
+                best = cand
+        selected = best[2] if best else None
+
+    if not selected:
+        return jsonify({"error": "No item found"}), 404
+
+    # --- build related items (only if your Excel has a usable core link column) ---
+    related = []
+    core_ref = (selected.get("_core") or "").strip()
+    sku = (selected.get("_sku") or "").strip()
+
+    if core_ref:
+        # if accessory points to a core, return that core
+        core_row = find_by_sku(core_ref)
+        if core_row:
+            related = [_related_payload(core_row)]
+    else:
+        # if it's a core, return accessories that point to it
+        rel_rows = _cache["by_core"].get(sku, [])
+        related = [_related_payload(r) for r in rel_rows]
+
+    return {
+        "result": _result_payload(selected),
+        "related_items": related,
+    }
 
 @limiter.limit(RATE_LIMIT_REFRESH)
 @app.post("/api/refresh")
@@ -612,7 +501,13 @@ def api_refresh():
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {API_REFRESH_TOKEN}":
             return jsonify({"error": "unauthorized"}), 401
-    return _proxy_upstream("POST")
+
+    try:
+        _load_excel_into_cache(force=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return {"ok": True, "loaded_at": _cache["loaded_at"], "row_count": len(_cache["rows"])}
 
 @app.errorhandler(429)
 def _ratelimit_handler(e):
