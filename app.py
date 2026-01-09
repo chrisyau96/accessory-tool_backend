@@ -43,10 +43,25 @@ RATE_LIMIT_SUGGEST = os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day")
 RATE_LIMIT_SEARCH = os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day")
 RATE_LIMIT_REFRESH = os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day")
 
-# ── Suggest broad-match tuning ───────────────────────────────────────────────
+# ── Broad-match tuning ───────────────────────────────────────────────────────
+# Applies local broad-match filtering + ranking on top of upstream responses.
 SUGGEST_BROAD_MATCH = os.getenv("SUGGEST_BROAD_MATCH", "true").lower() == "true"
-SUGGEST_FALLBACK_MIN_RESULTS = int(os.getenv("SUGGEST_FALLBACK_MIN_RESULTS", "1"))
-SUGGEST_FALLBACK_TIMEOUT_SEC = int(os.getenv("SUGGEST_FALLBACK_TIMEOUT_SEC", "30"))
+SEARCH_BROAD_MATCH = os.getenv("SEARCH_BROAD_MATCH", str(SUGGEST_BROAD_MATCH)).lower() == "true"
+
+# If upstream returns fewer than this, we will fan out to additional upstream queries (variants)
+BROAD_MATCH_FALLBACK_MIN_RESULTS = int(os.getenv("BROAD_MATCH_FALLBACK_MIN_RESULTS", "1"))
+
+# Total upstream calls per request: 1 (original) + (max_calls-1) variants
+BROAD_MATCH_MAX_UPSTREAM_CALLS = int(os.getenv("BROAD_MATCH_MAX_UPSTREAM_CALLS", "4"))
+
+# Cap merged candidates after de-dupe (helps keep response small / predictable)
+BROAD_MATCH_MAX_MERGED_RESULTS = int(os.getenv("BROAD_MATCH_MAX_MERGED_RESULTS", "50"))
+
+# Always re-rank results for suggest so "more parts matched => higher in list"
+SUGGEST_RERANK_ALWAYS = os.getenv("SUGGEST_RERANK_ALWAYS", "true").lower() == "true"
+SEARCH_RERANK_ALWAYS = os.getenv("SEARCH_RERANK_ALWAYS", "false").lower() == "true"
+
+BROAD_MATCH_TIMEOUT_SEC = int(os.getenv("BROAD_MATCH_TIMEOUT_SEC", "30"))
 
 # ── Security / Origins ───────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
@@ -115,7 +130,7 @@ def _proxy_upstream(method: str):
                 url,
                 params=request.args,
                 headers=headers,
-                timeout=SUGGEST_FALLBACK_TIMEOUT_SEC,
+                timeout=BROAD_MATCH_TIMEOUT_SEC,
             )
         else:
             json_body = request.get_json(force=False, silent=True)
@@ -125,7 +140,7 @@ def _proxy_upstream(method: str):
                 params=request.args,
                 json=json_body,
                 headers=headers,
-                timeout=SUGGEST_FALLBACK_TIMEOUT_SEC,
+                timeout=BROAD_MATCH_TIMEOUT_SEC,
             )
     except requests.RequestException:
         return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
@@ -136,7 +151,7 @@ def _proxy_upstream(method: str):
         resp.headers["Content-Type"] = content_type
     return resp
 
-# ── Broad-match helpers (used only for /api/suggest) ─────────────────────────
+# ── Broad-match helpers ──────────────────────────────────────────────────────
 def _extract_list_container(payload):
     """
     Returns (items_list, wrap_fn) where wrap_fn(new_items) returns same payload shape.
@@ -176,7 +191,6 @@ def _item_text(it) -> str:
     if not isinstance(it, dict):
         return str(it).lower()
 
-    # Try common fields (your upstream may differ; this is defensive)
     parts = []
     for key in (
         "name", "itemName", "item_name", "productName", "product_name",
@@ -189,7 +203,7 @@ def _item_text(it) -> str:
         if isinstance(val, str) and val.strip():
             parts.append(val.strip().lower())
 
-    # Fallback: include any string values (still safe but broader)
+    # Fallback: include any string values
     if not parts:
         for v in it.values():
             if isinstance(v, str) and v.strip():
@@ -200,17 +214,67 @@ def _item_text(it) -> str:
 def _token_match(haystack: str, tok: str) -> bool:
     if not tok:
         return False
+    # Keep very-short tokens from overmatching too aggressively
     if len(tok) <= 2:
-        # avoid crazy over-match for very short tokens like "ro"
         return re.search(rf"\b{re.escape(tok)}\b", haystack) is not None
     return tok in haystack
 
-def _pick_primary_token(tokens):
-    # Pick the "strongest" token to query upstream for candidates
-    # (longest token usually gives fewer but more relevant candidates)
+def _word_boundary_at(text: str, pos: int) -> bool:
+    return pos == 0 or (pos > 0 and not text[pos - 1].isalnum())
+
+def _word_boundary_after(text: str, end: int) -> bool:
+    return end >= len(text) or (end < len(text) and not text[end].isalnum())
+
+def _match_stats(text: str, tokens: list[str], raw_q: str):
+    """
+    Returns:
+      matched_count: int
+      quality_score: int (higher is better)
+    Primary sort is matched_count (more parts matched => higher rank).
+    """
     if not tokens:
-        return ""
-    return sorted(tokens, key=lambda x: len(x), reverse=True)[0]
+        return 0, 0
+
+    matched_positions = []
+    quality = 0
+    matched_count = 0
+
+    for t in tokens:
+        pos = text.find(t)
+        if pos == -1:
+            continue
+        matched_count += 1
+        end = pos + len(t)
+
+        # Base points for matching this token; longer tokens are more valuable
+        quality += 20 + min(len(t), 10)
+
+        # Better if token aligns to word boundaries / starts
+        if _word_boundary_at(text, pos):
+            quality += 10
+        if _word_boundary_at(text, pos) and _word_boundary_after(text, end):
+            quality += 6  # full-word match
+
+        # Earlier matches slightly better
+        if pos == 0:
+            quality += 6
+        elif pos < 15:
+            quality += 3
+        elif pos < 40:
+            quality += 1
+
+        matched_positions.append(pos)
+
+    # Phrase/sequence bonus (helps "hx9991 toothbrush" rank above just "hx9991")
+    condensed = " ".join(_tokenize_query(raw_q))
+    if condensed and condensed in text:
+        quality += 35
+
+    # Tokens appearing in order
+    if len(matched_positions) >= 2 and matched_positions == sorted(matched_positions):
+        quality += 10
+
+    return matched_count, quality
 
 def _item_key(it):
     if isinstance(it, dict):
@@ -220,46 +284,140 @@ def _item_key(it):
                 return f"{k}:{str(v).strip()}"
     return f"repr:{repr(it)}"
 
-def _score_item(it_text: str, tokens, raw_q: str) -> int:
-    score = 0
-    # bonus if raw query (condensed spaces) appears as substring
-    condensed = " ".join(tokens)
-    if condensed and condensed in it_text:
-        score += 20
-    # token-wise bonuses
-    for t in tokens:
-        if _token_match(it_text, t):
-            score += 10
-            if it_text.startswith(t):
-                score += 3
-    return score
+def _dedup_keep_order(items: list):
+    out = []
+    seen = set()
+    for it in items:
+        k = _item_key(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
 
-def _broad_suggest_response():
-    """
-    Broad-match enhancement:
-    - If q has multiple tokens, call upstream with full q first.
-    - If results are empty / too few, call upstream with primary token to get candidates,
-      then filter candidates by requiring ALL tokens to match somewhere in the item text.
-    - De-dup and rank.
-    - Preserve upstream response shape.
-    """
-    q = request.args.get("q") or request.args.get("query") or request.args.get("term") or ""
-    tokens = _tokenize_query(q)
+def _guess_query_key_from_args():
+    # prefer whatever the caller actually used
+    for k in ("q", "query", "term"):
+        if request.args.get(k):
+            return k
+    return "q"
 
-    # If not multi-token or disabled, just proxy
-    if not SUGGEST_BROAD_MATCH or len(tokens) <= 1:
+def _guess_query_key_from_body(body: dict):
+    for k in ("q", "query", "term"):
+        v = body.get(k)
+        if isinstance(v, str):
+            return k
+    return "q"
+
+def _variants_from_token(t: str):
+    """
+    Generate broader query variants to get a larger candidate pool from upstream.
+    Example: 'hx9991' -> ['hx9991', 'hx', 'hx999', 'hx99', 'hx9', '9991']
+             'phili'  -> ['phili', 'phil', 'phi']
+    """
+    t = (t or "").strip().lower()
+    if not t:
+        return []
+
+    variants = [t]
+
+    letters = "".join(re.findall(r"[a-z]+", t))
+    digits = "".join(re.findall(r"[0-9]+", t))
+
+    # Useful for model numbers like hx9991 -> hx
+    if letters and letters != t:
+        variants.append(letters)
+
+    if digits and digits != t:
+        variants.append(digits)
+
+    # Prefixes (broader). Keep >= 3 usually, but allow 2 for things like 'hx'.
+    for n in (6, 5, 4, 3, 2):
+        if len(t) > n:
+            variants.append(t[:n])
+
+    if letters:
+        for n in (4, 3, 2):
+            if len(letters) > n:
+                variants.append(letters[:n])
+
+    # de-dup preserve order
+    out = []
+    seen = set()
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+def _build_upstream_query_variants(raw_q: str):
+    """
+    Build a short list of upstream query strings to try (in order),
+    excluding the original raw_q (which is always tried first).
+    """
+    tokens = _tokenize_query(raw_q)
+    if not tokens:
+        return []
+
+    # Try longer tokens first (they usually narrow the candidate pool in a useful way)
+    tokens_sorted = sorted(tokens, key=len, reverse=True)
+
+    variants = []
+    for t in tokens_sorted:
+        variants.extend(_variants_from_token(t))
+
+    # de-dup, remove exact original normalized duplicates
+    raw_norm = (raw_q or "").strip().lower()
+    out = []
+    seen = set()
+    for v in variants:
+        if not v:
+            continue
+        if v == raw_norm:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+
+    return out
+
+def _call_upstream_get(url: str, headers: dict, args: dict):
+    try:
+        return requests.get(url, params=args, headers=headers, timeout=BROAD_MATCH_TIMEOUT_SEC)
+    except requests.RequestException:
+        return None
+
+def _call_upstream_post(url: str, headers: dict, args: dict, body: dict):
+    try:
+        return requests.post(url, params=args, json=body, headers=headers, timeout=BROAD_MATCH_TIMEOUT_SEC)
+    except requests.RequestException:
+        return None
+
+def _broad_match_response_for_get(always_rerank: bool):
+    """
+    Broad match for GET endpoints (/api/suggest):
+      - Try upstream with original query
+      - If too few, fan out to variant upstream queries to gather candidates
+      - Locally rank so: more tokens matched => higher rank
+    """
+    q_key = _guess_query_key_from_args()
+    raw_q = request.args.get(q_key, "") or ""
+    tokens = _tokenize_query(raw_q)
+
+    # If no query, just proxy
+    if not raw_q.strip():
         return _proxy_upstream("GET")
 
-    headers = _forward_headers()
     url = _upstream_url(request.path)
+    headers = _forward_headers()
 
-    # 1) Try upstream with original query first
-    try:
-        upstream_full = requests.get(url, params=request.args, headers=headers, timeout=SUGGEST_FALLBACK_TIMEOUT_SEC)
-    except requests.RequestException:
+    # 1) Original upstream call
+    upstream_full = _call_upstream_get(url, headers, request.args)
+    if upstream_full is None:
         return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
 
-    # If upstream didn't return JSON or failed, just return it as-is
+    # If upstream is not JSON, pass-through
     try:
         payload_full = upstream_full.json()
     except Exception:
@@ -270,69 +428,153 @@ def _broad_suggest_response():
         return resp
 
     items_full, wrap_full = _extract_list_container(payload_full)
-    if items_full is None:
-        # Unknown shape -> return upstream untouched
+    if items_full is None or not isinstance(items_full, list):
+        return jsonify(payload_full), upstream_full.status_code
+
+    # Start candidate pool with what we already have
+    candidates = list(items_full)
+
+    # 2) If too few results, gather more candidates using upstream variants
+    if SUGGEST_BROAD_MATCH and (len(items_full) < BROAD_MATCH_FALLBACK_MIN_RESULTS):
+        variants = _build_upstream_query_variants(raw_q)
+        max_extra_calls = max(0, BROAD_MATCH_MAX_UPSTREAM_CALLS - 1)
+
+        # Keep original args, just change q param
+        base_args = request.args.to_dict(flat=True)
+
+        calls = 0
+        for v in variants:
+            if calls >= max_extra_calls:
+                break
+            args2 = dict(base_args)
+            args2[q_key] = v
+            r = _call_upstream_get(url, headers, args2)
+            if r is None:
+                continue
+            try:
+                payload_v = r.json()
+            except Exception:
+                continue
+            items_v, _wrap_v = _extract_list_container(payload_v)
+            if isinstance(items_v, list) and items_v:
+                candidates.extend(items_v)
+                calls += 1
+
+    candidates = _dedup_keep_order(candidates)
+
+    # 3) Local broad-match filter + rank
+    # Keep anything that matches at least 1 token; rank by matched token count then quality.
+    if (SUGGEST_BROAD_MATCH or always_rerank) and tokens:
+        scored = []
+        for it in candidates:
+            text = _item_text(it)
+            matched_count, quality = _match_stats(text, tokens, raw_q)
+            if matched_count >= 1:
+                scored.append((matched_count, quality, it))
+
+        # If nothing matched locally, fall back to upstream as-is
+        if scored:
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            ranked = [it for _, __, it in scored]
+        else:
+            ranked = items_full
+    else:
+        ranked = items_full
+
+    if BROAD_MATCH_MAX_MERGED_RESULTS > 0:
+        ranked = ranked[:BROAD_MATCH_MAX_MERGED_RESULTS]
+
+    out_payload = wrap_full(ranked) if wrap_full else ranked
+    return jsonify(out_payload), upstream_full.status_code
+
+def _broad_match_response_for_post(always_rerank: bool):
+    """
+    Broad match for POST endpoints (/api/search) if enabled:
+      - Try upstream with original body
+      - If too few, fan out to variant upstream queries to gather candidates
+      - Locally rank so: more tokens matched => higher rank
+    """
+    body = request.get_json(force=False, silent=True)
+    if not isinstance(body, dict):
+        return _proxy_upstream("POST")
+
+    q_key = _guess_query_key_from_body(body)
+    raw_q = body.get(q_key) if isinstance(body.get(q_key), str) else ""
+    tokens = _tokenize_query(raw_q)
+
+    # If no query, just proxy
+    if not (raw_q or "").strip():
+        return _proxy_upstream("POST")
+
+    url = _upstream_url(request.path)
+    headers = _forward_headers()
+
+    # 1) Original upstream call
+    upstream_full = _call_upstream_post(url, headers, request.args, body)
+    if upstream_full is None:
+        return jsonify({"error": "Upstream accessory tool backend unavailable"}), 502
+
+    try:
+        payload_full = upstream_full.json()
+    except Exception:
         resp = make_response(upstream_full.content, upstream_full.status_code)
         ct = upstream_full.headers.get("Content-Type")
         if ct:
             resp.headers["Content-Type"] = ct
         return resp
 
-    # If enough results already, keep upstream behavior (but we could still re-rank if you want)
-    if isinstance(items_full, list) and len(items_full) >= SUGGEST_FALLBACK_MIN_RESULTS:
+    items_full, wrap_full = _extract_list_container(payload_full)
+    if items_full is None or not isinstance(items_full, list):
         return jsonify(payload_full), upstream_full.status_code
 
-    # 2) Fallback: query upstream by primary token to get a broader candidate pool
-    primary = _pick_primary_token(tokens)
-    if not primary:
-        return jsonify(payload_full), upstream_full.status_code
+    candidates = list(items_full)
 
-    args2 = request.args.to_dict(flat=True)
-    args2["q"] = primary  # ensure upstream gets something it can match
+    # 2) If too few results, gather more via variant queries
+    if SEARCH_BROAD_MATCH and (len(items_full) < BROAD_MATCH_FALLBACK_MIN_RESULTS):
+        variants = _build_upstream_query_variants(raw_q)
+        max_extra_calls = max(0, BROAD_MATCH_MAX_UPSTREAM_CALLS - 1)
 
-    try:
-        upstream_primary = requests.get(url, params=args2, headers=headers, timeout=SUGGEST_FALLBACK_TIMEOUT_SEC)
-    except requests.RequestException:
-        return jsonify(payload_full), upstream_full.status_code  # best effort: return the original
+        calls = 0
+        for v in variants:
+            if calls >= max_extra_calls:
+                break
+            body2 = dict(body)
+            body2[q_key] = v
+            r = _call_upstream_post(url, headers, request.args, body2)
+            if r is None:
+                continue
+            try:
+                payload_v = r.json()
+            except Exception:
+                continue
+            items_v, _wrap_v = _extract_list_container(payload_v)
+            if isinstance(items_v, list) and items_v:
+                candidates.extend(items_v)
+                calls += 1
 
-    try:
-        payload_primary = upstream_primary.json()
-    except Exception:
-        # Can't parse fallback; return original
-        return jsonify(payload_full), upstream_full.status_code
+    candidates = _dedup_keep_order(candidates)
 
-    items_primary, wrap_primary = _extract_list_container(payload_primary)
-    if not isinstance(items_primary, list):
-        return jsonify(payload_full), upstream_full.status_code
+    # 3) Local broad-match filter + rank
+    if (SEARCH_BROAD_MATCH or always_rerank) and tokens:
+        scored = []
+        for it in candidates:
+            text = _item_text(it)
+            matched_count, quality = _match_stats(text, tokens, raw_q)
+            if matched_count >= 1:
+                scored.append((matched_count, quality, it))
 
-    # 3) Filter candidates by requiring ALL tokens to be present
-    filtered = []
-    for it in items_primary:
-        text = _item_text(it)
-        if all(_token_match(text, t) for t in tokens):
-            filtered.append(it)
+        if scored:
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            ranked = [it for _, __, it in scored]
+        else:
+            ranked = items_full
+    else:
+        ranked = items_full
 
-    # 4) Merge with full results (if any), de-dup, rank
-    merged = []
-    seen = set()
+    if BROAD_MATCH_MAX_MERGED_RESULTS > 0:
+        ranked = ranked[:BROAD_MATCH_MAX_MERGED_RESULTS]
 
-    for it in (items_full or []):
-        k = _item_key(it)
-        if k not in seen:
-            seen.add(k)
-            merged.append(it)
-
-    for it in filtered:
-        k = _item_key(it)
-        if k not in seen:
-            seen.add(k)
-            merged.append(it)
-
-    # Rank by our broad-match score
-    merged.sort(key=lambda it: _score_item(_item_text(it), tokens, q), reverse=True)
-
-    # Preserve the "full query" payload shape (preferred), else fallback payload shape
-    out_payload = wrap_full(merged) if wrap_full else (wrap_primary(merged) if wrap_primary else merged)
+    out_payload = wrap_full(ranked) if wrap_full else ranked
     return jsonify(out_payload), upstream_full.status_code
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -348,13 +590,20 @@ def api_meta():
 @limiter.limit(RATE_LIMIT_SUGGEST)
 @app.get("/api/suggest")
 def api_suggest():
-    # Broad-match enhanced suggest (multi-token query)
-    return _broad_suggest_response()
+    # Broad-match + ranking:
+    # - single-token searches like "phili" or "hx999" now also benefit
+    # - multi-token searches like "hx9991 toothbrush" rank higher when more tokens match
+    if not SUGGEST_BROAD_MATCH and not SUGGEST_RERANK_ALWAYS:
+        return _proxy_upstream("GET")
+    return _broad_match_response_for_get(always_rerank=SUGGEST_RERANK_ALWAYS)
 
 @limiter.limit(RATE_LIMIT_SEARCH)
 @app.post("/api/search")
 def api_search():
-    return _proxy_upstream("POST")
+    # Optional broad-match for search (POST). Enable with SEARCH_BROAD_MATCH=true
+    if not SEARCH_BROAD_MATCH and not SEARCH_RERANK_ALWAYS:
+        return _proxy_upstream("POST")
+    return _broad_match_response_for_post(always_rerank=SEARCH_RERANK_ALWAYS)
 
 @limiter.limit(RATE_LIMIT_REFRESH)
 @app.post("/api/refresh")
