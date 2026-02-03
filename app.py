@@ -412,10 +412,10 @@ def api_suggest():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"suggestions": []})
-    ql = q.lower()
 
     df = load_df()
     lang = _norm_lang(request.args.get("lang"))
+
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     q_type = (request.args.get("type") or "").strip()
@@ -430,39 +430,82 @@ def api_suggest():
     if q_brand and brand_col in filtered.columns:
         filtered = filtered[filtered[brand_col] == q_brand]
 
-    if not (brand_col and product_col):
+    # English columns (used as an additional matching surface when site language is not English)
+    brand_col_en, product_col_en, *_ = _select_cols(filtered, "en")
+
+    # If neither current language nor English name columns exist, we cannot suggest.
+    if not ((brand_col and product_col) or (brand_col_en and product_col_en)):
         return jsonify({"suggestions": []})
 
-    names = [
-        _display_name(b, p, lang)
-        for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
-    ]
-    names = pd.Series(names).dropna().astype(str).unique().tolist()
+    disp_lang = (
+        [
+            _display_name(b, p, lang)
+            for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
+        ]
+        if (brand_col and product_col)
+        else [""] * len(filtered)
+    )
 
-    # Broad match for free-text input:
+    disp_en = (
+        [
+            _display_name(b, p, "en")
+            for b, p in zip(filtered.get(brand_col_en), filtered.get(product_col_en))
+        ]
+        if (brand_col_en and product_col_en)
+        else [""] * len(filtered)
+    )
+
+    # Broad match:
     # - Split the query into tokens (e.g. "philips toothbrush" -> ["philips", "toothbrush"])
-    # - A name matches if *every* query token matches somewhere in the name (order-independent).
+    # - A candidate matches if *every* query token matches somewhere in the candidate (order-independent).
+    # - Uses prefix/contains checks to support partial typing (e.g. "tooth" matches "toothbrush").
     def _tokenize(s: str) -> list[str]:
-        return [t for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower()) if t]
+        return [
+            t
+            for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower())
+            if t
+        ]
 
     q_tokens = _tokenize(q)
     if not q_tokens:
         return jsonify({"suggestions": []})
 
-    def broad_match(name: str) -> bool:
-        name_l = (name or "").lower()
-        name_tokens = _tokenize(name_l)
+    def _broad_match(candidate: str) -> bool:
+        cand = (candidate or "").lower()
+        if not cand:
+            return False
+        cand_tokens = _tokenize(cand)
         for qt in q_tokens:
-            if qt in name_l:
+            # quick substring check
+            if qt in cand:
                 continue
-            if any(nt.startswith(qt) or qt in nt for nt in name_tokens):
+            # token-level check
+            if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
                 continue
             return False
         return True
 
-    matched = [n for n in names if broad_match(n)]
-    matched = sorted(matched)[:MAX_SUGGESTIONS]
-    return jsonify({"suggestions": matched})
+    suggestions = []
+    seen = set()
+
+    for dl, de in zip(disp_lang, disp_en):
+        dl = (dl or "").strip()
+        de = (de or "").strip()
+
+        # Match against current-language *and* English name.
+        # Example: when lang is zh-hk, typing "toothbrush" can still surface results,
+        # and we return the zh-hk display name (if available).
+        if not (_broad_match(dl) or _broad_match(de)):
+            continue
+
+        out = dl or de  # prefer localized display name
+        if out and out not in seen:
+            seen.add(out)
+            suggestions.append(out)
+
+    suggestions = sorted(suggestions)[:MAX_SUGGESTIONS]
+    return jsonify({"suggestions": suggestions})
+
 
 @limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
