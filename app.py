@@ -1,38 +1,52 @@
 import os
 import re
 import time
-import threading
 from io import BytesIO
 from urllib.parse import urlparse
 
+import pandas as pd
 import requests
-from openpyxl import load_workbook
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-
 app = Flask(__name__)
 
-# ── CORS / Origin allowlist ──────────────────────────────────────────────────
-_frontend_origins = [
-    o.strip()
-    for o in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if o.strip()
-]
+# ── Config / Env ─────────────────────────────────────────────────────────────
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
 
+# Master dataset (original)
+DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
+DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
+
+# NEW: Department mapping dataset
+DEPT_MAP_PATH = os.getenv("DEPT_MAP_PATH", "mapping.xlsx")
+
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
+
+_frontend_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
 if not _frontend_origins:
     CORS(app)
 else:
     CORS(app, resources={r"/api/*": {"origins": _frontend_origins}})
 
+limiter = Limiter(key_func=get_remote_address, default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")])
+limiter.init_app(app)
+
+# Cache holds the merged DataFrame (master + mapping)
+_CACHE = {"df": None, "ts": 0}
+
 ENFORCE_ORIGIN = os.getenv("ENFORCE_ORIGIN", "true").lower() == "true"
 ALLOWED_ORIGINS = {o.lower() for o in _frontend_origins}
-
 API_REFRESH_TOKEN = os.getenv("API_REFRESH_TOKEN", "")
+MAX_ITEM_NAMES = int(os.getenv("MAX_ITEM_NAMES", "200"))
+MAX_SUGGESTIONS = int(os.getenv("MAX_SUGGESTIONS", "20"))
+NUMBER_SEARCH_DELAY_MS = int(os.getenv("NUMBER_SEARCH_DELAY_MS", "250"))
 
+# ── Security / Origins ───────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
     try:
         p = urlparse(value)
@@ -45,31 +59,22 @@ def _normalize_origin(value: str) -> str:
 def _origin_allowed() -> bool:
     if not ENFORCE_ORIGIN or not ALLOWED_ORIGINS:
         return True
-
     origin = request.headers.get("Origin", "")
     ref = request.headers.get("Referer", "")
-
-    # Browser fetch sends Origin for cross-origin calls
     if origin:
         return _normalize_origin(origin) in ALLOWED_ORIGINS
     if ref:
         return _normalize_origin(ref) in ALLOWED_ORIGINS
-
-    # If no Origin/Referer, block only if you want to be strict.
-    # For SmartEdit / browsers, you should normally get Origin.
     return False
 
 @app.before_request
 def _block_unknown_origins():
     if request.path == "/api/healthz":
         return
-
-    # allow refresh with bearer token even if origin is not present
     if request.path == "/api/refresh":
         auth = request.headers.get("Authorization", "")
         if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
             return
-
     if request.path.startswith("/api/"):
         if not _origin_allowed():
             return jsonify({"error": "origin not allowed"}), 403
@@ -80,434 +85,440 @@ def _security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
-    )
-    resp.headers["Strict-Transport-Security"] = (
-        "max-age=31536000; includeSubDomains"
-    )
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
 
-# ── Rate limiting ────────────────────────────────────────────────────────────
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")]
-)
-limiter.init_app(app)
+# ── Column helpers ───────────────────────────────────────────────────────────
+def _get_series(row, *names):
+    for n in names:
+        if n in row:
+            return row.get(n)
+    return None
 
-RATE_LIMIT_META = os.getenv("RATE_LIMIT_META", "30/minute;1000/day")
-RATE_LIMIT_SUGGEST = os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day")
-RATE_LIMIT_SEARCH = os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day")
-RATE_LIMIT_REFRESH = os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day")
+def _get_col(df, *names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
 
-# ── GitHub data source config ────────────────────────────────────────────────
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-DATA_REPO = os.getenv("DATA_REPO", "")          # "owner/repo"
-DATA_PATH = os.getenv("DATA_PATH", "")          # "file.xlsx" or "folder/file.xlsx"
-DATA_SHEET = os.getenv("DATA_SHEET", "")        # "Export Worksheet"
-DATA_REF = os.getenv("DATA_REF", "main")        # branch/tag/commit
-
-DATA_CACHE_TTL_SEC = int(os.getenv("DATA_CACHE_TTL_SEC", "600"))  # 10 min
-
-SUGGEST_LIMIT = int(os.getenv("SUGGEST_LIMIT", "20"))
-
-# ── In-memory cache ──────────────────────────────────────────────────────────
-_lock = threading.Lock()
-_cache = {
-    "loaded_at": 0.0,
-    "rows": [],
-    "by_sku": {},          # sku -> row
-    "by_label": {},        # label_lower -> row
-    "by_core": {},         # core_sku -> [rows] (accessories)
-    "last_error": "",
-}
-
-def _gh_headers_raw():
+# ── Data access ──────────────────────────────────────────────────────────────
+def _fetch_excel_bytes_from_github_path(path: str) -> bytes:
     if not GITHUB_TOKEN:
-        return {}
-    # Fine-grained tokens work with Bearer; classic PAT also works
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.raw",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "accessory-tool-backend",
+        raise RuntimeError("Server missing GITHUB_TOKEN")
+    url = f"https://api.github.com/repos/{DATA_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.raw",
+        "User-Agent": "core-accessory-tool",
     }
-
-def _download_excel_bytes() -> bytes:
-    if not (DATA_REPO and DATA_PATH and GITHUB_TOKEN):
-        raise RuntimeError("Missing DATA_REPO / DATA_PATH / GITHUB_TOKEN")
-
-    # This endpoint returns RAW bytes when Accept: application/vnd.github.raw is used
-    url = f"https://api.github.com/repos/{DATA_REPO}/contents/{DATA_PATH}"
-    params = {"ref": DATA_REF} if DATA_REF else None
-
-    r = requests.get(url, headers=_gh_headers_raw(), params=params, timeout=30)
-    if r.status_code == 404:
-        raise RuntimeError("GitHub file not found (check DATA_REPO/DATA_PATH/DATA_REF)")
-    if r.status_code == 401 or r.status_code == 403:
-        raise RuntimeError("GitHub unauthorized/forbidden (check token permissions)")
+    r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
+    # Filter bundles if present
+    if "BUNDLE_TYPE" in df.columns:
+        df = df[df["BUNDLE_TYPE"].isin(["Compatible", "Consumable"])].copy()
+    # String SKU padded to 8 digits
+    item_col = _get_col(df, "ITEM", "Item")
+    if item_col:
+        df["Item_str"] = (
+            df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+        )
+    return df
 
-def _pick_col(headers_norm: list[str], candidates: list[str]) -> int | None:
+def _load_dept_mapping() -> pd.DataFrame:
     """
-    Find a column index by matching normalized header names.
-    candidates should already be normalized-like (we normalize inside).
+    Returns columns:
+      ITEM_DEPT_NAME, ITEM_DEPT_NAME_EN, ITEM_DEPT_NAME_TC, ITEM_DEPT_NAME_SC
     """
-    cand = {_norm(x) for x in candidates}
-    for i, h in enumerate(headers_norm):
-        if h in cand:
-            return i
+    try:
+        content = _fetch_excel_bytes_from_github_path(DEPT_MAP_PATH)
+        dfm = pd.read_excel(BytesIO(content), engine="openpyxl")
+    except Exception:
+        dfm = pd.DataFrame()
+
+    dfm.columns = [str(c).strip() for c in dfm.columns]
+    for c in ["ITEM_DEPT_NAME","ITEM_DEPT_NAME_EN","ITEM_DEPT_NAME_TC","ITEM_DEPT_NAME_SC"]:
+        if c not in dfm.columns:
+            dfm[c] = ""
+    dfm["ITEM_DEPT_NAME"] = dfm["ITEM_DEPT_NAME"].astype(str).str.strip()
+    return dfm
+
+def load_df(force: bool = False) -> pd.DataFrame:
+    now = time.time()
+    if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
+        return _CACHE["df"]
+
+    # Load master
+    content = _fetch_excel_bytes_from_github_path(DATA_PATH)
+    if DATA_SHEET:
+        df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
+    else:
+        df = pd.read_excel(BytesIO(content), engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+    df = _post_load_normalize(df)
+
+    # Merge department mapping on ITEM_DEPT_NAME
+    df_map = _load_dept_mapping()
+    if "ITEM_DEPT_NAME" in df.columns and not df_map.empty:
+        df["ITEM_DEPT_NAME"] = df["ITEM_DEPT_NAME"].astype(str).str.strip()
+        df = df.merge(df_map, on="ITEM_DEPT_NAME", how="left")
+
+    _CACHE.update({"df": df, "ts": now})
+    return df
+
+def extract_sku_from_url(url: str) -> str | None:
+    for p in (r"variant=(\d{8})", r"/p/(\d{8})", r"/p/BP_(\d{8})"):
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
     return None
 
-def _tokenize(q: str) -> list[str]:
-    q = (q or "").strip().lower()
-    toks = re.findall(r"[a-z0-9]+", q)
-    # de-dup keep order
-    seen = set()
-    out = []
-    for t in toks:
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+# ── Language helpers ─────────────────────────────────────────────────────────
+LANG_BRAND_MAP = {"en": "BRAND_NAME_EN", "tc": "BRAND_NAME_TC", "sc": "BRAND_NAME_SC"}
+LANG_PRODUCT_MAP = {"en": "PRODUCT_NAME_EN", "tc": "PRODUCT_NAME_TC", "sc": "PRODUCT_NAME_SC"}
 
-def _score(text: str, tokens: list[str]) -> tuple[int, int]:
+def _norm_lang(s: str | None) -> str:
+    s = (s or "en").lower()
+    return "tc" if s == "zh-hk" else "sc" if s == "zh-cn" else ("en" if s not in ("en","tc","sc") else s)
+
+def _safe_str(v) -> str:
+    """Return '' for NaN/None, else str(v)."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v)
+
+def _cap_words_en(brand: str) -> str:
+    if not brand:
+        return brand
+    if re.search(r"[^\x00-\x7F]", brand):
+        return brand
+    return re.sub(r"[A-Za-z]+", lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), brand)
+
+def _display_name(brand, product, lang: str) -> str:
+    b = _safe_str(brand).strip()
+    p = _safe_str(product).strip()
+    if not b and not p:
+        return ""
+    if lang == "en":
+        b_disp = _cap_words_en(b)
+        bl = b.lower()
+        pl = p.lower()
+        if pl.startswith(bl + " "):
+            return b_disp + p[len(b):]
+        if pl == bl:
+            return b_disp
+        return f"{b_disp} {p}".strip()
+    if p.startswith(b + " "):
+        return b + p[len(b):]
+    if p == b:
+        return b
+    return f"{b} {p}".strip()
+
+def _brand_for_display(brand, lang: str) -> str:
+    b = _safe_str(brand)
+    return _cap_words_en(b) if lang == "en" else b
+
+def _allow_to_buy_val(val) -> int:
+    try:
+        return 1 if int(val) == 1 else 0
+    except Exception:
+        return 1 if str(val).strip() == "1" else 0
+
+def _dept_label(row_like, lang: str) -> str:
     """
-    Sort key: (matched_token_count, quality)
-    More tokens matched => higher rank, as you requested.
+    row_like: Series or DataFrame row with mapping columns
     """
-    t = text.lower()
-    matched = 0
-    quality = 0
-    for tok in tokens:
-        pos = t.find(tok)
-        if pos == -1:
-            continue
-        matched += 1
-        quality += 10 + min(len(tok), 10)
-        if pos == 0:
-            quality += 3
-        elif pos < 20:
-            quality += 1
-    return matched, quality
+    col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+    # try localized, fallback raw
+    lbl = _safe_str(row_like.get(col)) if hasattr(row_like, "get") else ""
+    if lbl:
+        return lbl
+    return _safe_str(row_like.get("ITEM_DEPT_NAME")) if hasattr(row_like, "get") else ""
 
-def _build_label(brand: str, name: str, sku: str) -> str:
-    brand = str(brand or "").strip()
-    name = str(name or "").strip()
-    sku = str(sku or "").strip()
-
-    if brand and name:
-        # avoid "brand brand ..."
-        if _norm(name).startswith(_norm(brand)):
-            label = name
-        else:
-            label = f"{brand} {name}"
+# ── Column selection usable for DataFrame *or* Series ────────────────────────
+def _select_cols(df_like, lang: str):
+    if hasattr(df_like, "columns"):
+        cols = set(map(str, df_like.columns))
+    elif hasattr(df_like, "index"):
+        cols = set(map(str, df_like.index))
     else:
-        label = name or brand or sku
+        cols = set()
 
-    return label.strip()
+    def has(c): return c in cols
 
-def _load_excel_into_cache(force: bool = False):
-    with _lock:
-        now = time.time()
-        if not force and _cache["rows"] and (now - _cache["loaded_at"] < DATA_CACHE_TTL_SEC):
-            return
+    brand_col = LANG_BRAND_MAP[lang] if has(LANG_BRAND_MAP[lang]) else None
+    product_col = LANG_PRODUCT_MAP[lang] if has(LANG_PRODUCT_MAP[lang]) else None
+    item_col = "ITEM" if has("ITEM") else ("Item" if has("Item") else None)
+    dept_col = "ITEM_DEPT_NAME" if has("ITEM_DEPT_NAME") else None
+    type_col = "ITEM_TYPE" if has("ITEM_TYPE") else None
+    bundle_col = "BUNDLE_ID" if has("BUNDLE_ID") else None
+    allow_col = "ALLOW_TO_BUY" if has("ALLOW_TO_BUY") else ("Allow To Buy" if has("Allow To Buy") else None)
+    rrp_col = "RRP" if has("RRP") else None
+    return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
 
+# ── Builders ─────────────────────────────────────────────────────────────────
+def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
+    brand_col, product_col, *_ = _select_cols(df, lang)
+    if not (brand_col and product_col):
+        return pd.DataFrame()
+    tmp = df[[c for c in (brand_col, product_col) if c in df.columns]].copy()
+    tmp["_disp"] = [
+        _display_name(b, p, lang) for b, p in zip(tmp.get(brand_col), tmp.get(product_col))
+    ]
+    return df[tmp["_disp"] == name]
+
+def _row_to_result(row: pd.Series, lang: str) -> dict:
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
+    brand_raw = _safe_str(_get_series(row, brand_col))
+    product_raw = _safe_str(_get_series(row, product_col))
+    dept_raw = _safe_str(_get_series(row, dept_col))
+    dept_disp = _dept_label(row, lang)  # localized label
+
+    item_type = _safe_str(_get_series(row, type_col))
+    type_label = "Accessory" if item_type == "A" else "Core Item"
+    item = _safe_str(_get_series(row, "Item_str"))
+    allow = _allow_to_buy_val(_get_series(row, allow_col) if allow_col else None)
+
+    rrp = None
+    rrp_cell = _get_series(row, "RRP")
+    if rrp_cell is not None and pd.notna(rrp_cell):
         try:
-            b = _download_excel_bytes()
-            wb = load_workbook(filename=BytesIO(b), read_only=True, data_only=True)
+            rrp = float(rrp_cell)
+        except Exception:
+            rrp = None
 
-            sheet_name = DATA_SHEET if DATA_SHEET in wb.sheetnames else wb.sheetnames[0]
-            ws = wb[sheet_name]
+    brand_disp = _brand_for_display(brand_raw, lang)
+    item_name_disp = _display_name(brand_raw, product_raw, lang)
 
-            # read header row
-            rows_iter = ws.iter_rows(values_only=True)
-            header = next(rows_iter, None)
-            if not header:
-                raise RuntimeError("Excel sheet has no header row")
-
-            headers = [str(h or "").strip() for h in header]
-            headers_norm = [_norm(h) for h in headers]
-
-            # Common column name candidates (adjust if your Excel uses different headers)
-            idx_sku = _pick_col(headers_norm, ["Item", "SKU", "Item No", "item", "item_no", "product_number"])
-            idx_brand = _pick_col(headers_norm, ["Brand", "brand"])
-            idx_dept = _pick_col(headers_norm, ["Department", "department", "Category", "category"])
-            idx_name = _pick_col(headers_norm, ["Item Name (retek)", "item_name_retek", "Item Name", "item_name", "Product Name"])
-            idx_type = _pick_col(headers_norm, ["item_type", "Item Type", "Type", "type"])
-            idx_rrp = _pick_col(headers_norm, ["RRP", "rrp"])
-            idx_allow = _pick_col(headers_norm, ["Allow To Buy", "AllowToBuy", "allow_to_buy"])
-
-            # Optional "core link" column (if your sheet has it)
-            idx_core = _pick_col(headers_norm, ["Core Item", "core_item", "Parent Item", "parent_item", "Main Item", "main_item", "Core SKU", "core_sku"])
-
-            data_rows = []
-            by_sku = {}
-            by_label = {}
-            by_core = {}
-
-            for r in rows_iter:
-                # skip empty rows
-                if not r or all(v is None or str(v).strip() == "" for v in r):
-                    continue
-
-                def get(i):
-                    if i is None:
-                        return ""
-                    if i >= len(r):
-                        return ""
-                    v = r[i]
-                    return "" if v is None else str(v).strip()
-
-                sku = get(idx_sku)
-                brand = get(idx_brand)
-                dept = get(idx_dept)
-                name = get(idx_name)
-                itype = get(idx_type)
-                rrp = get(idx_rrp)
-                allow = get(idx_allow)
-                core = get(idx_core)
-
-                label = _build_label(brand, name, sku)
-
-                row_obj = {
-                    "_sku": sku,
-                    "_brand": brand,
-                    "_dept": dept,
-                    "_name": name,
-                    "_type": itype,
-                    "_rrp": rrp,
-                    "_allow": allow,
-                    "_core": core,
-                    "_label": label,
-                    "_search": _norm(f"{sku} {brand} {name} {dept} {itype} {core} {label}"),
-                }
-                data_rows.append(row_obj)
-
-                if sku:
-                    by_sku[sku] = row_obj
-                if label:
-                    by_label[_norm(label)] = row_obj
-
-                # if accessory rows point to a core SKU, index them
-                if core:
-                    by_core.setdefault(core, []).append(row_obj)
-
-            _cache["rows"] = data_rows
-            _cache["by_sku"] = by_sku
-            _cache["by_label"] = by_label
-            _cache["by_core"] = by_core
-            _cache["loaded_at"] = time.time()
-            _cache["last_error"] = ""
-
-        except Exception as e:
-            _cache["last_error"] = str(e)
-            # Keep old cache if it exists, so service still works with last good data
-            if not _cache["rows"]:
-                raise
-
-def _ensure_data_loaded():
-    _load_excel_into_cache(force=False)
-
-def _result_payload(row_obj):
-    # keys that your frontend already knows how to read
     return {
-        "department": row_obj.get("_dept", ""),
-        "brand": row_obj.get("_brand", ""),
-        "item_name_retek": row_obj.get("_label", "") or row_obj.get("_name", ""),
-        "item_type": row_obj.get("_type", ""),
-        "rrp": row_obj.get("_rrp", ""),
-        "allow_to_buy": row_obj.get("_allow", ""),
-        "item": row_obj.get("_sku", ""),
+        "item": item,
+        "item_name_retek": item_name_disp,
+        "item_name": item_name_disp,
+        "brand": brand_disp,
+        "department": dept_disp,       # localized
+        "department_raw": dept_raw,    # raw (handy if needed)
+        "item_type": item_type,
+        "type_label": type_label,
+        "rrp": rrp,
+        "allow_to_buy": allow,
     }
 
-def _related_payload(row_obj):
-    return {
-        "Department": row_obj.get("_dept", ""),
-        "Brand": row_obj.get("_brand", ""),
-        "Item Name (retek)": row_obj.get("_label", "") or row_obj.get("_name", ""),
-        "RRP": row_obj.get("_rrp", ""),
-        "Allow To Buy": row_obj.get("_allow", ""),
-        "Item": row_obj.get("_sku", ""),
-    }
+def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    if not (bundle_col and type_col) or pd.isna(row.get(bundle_col)):
+        return []
 
-def _is_core(row_obj) -> bool:
-    t = (row_obj.get("_type") or "").strip().lower()
-    return t.startswith("c") or "core" in t
+    opposite_type = "C" if row.get(type_col) == "A" else "A"
+    rel = df[(df[bundle_col] == row.get(bundle_col)) & (df[type_col] == opposite_type)].copy()
 
-def _is_accessory(row_obj) -> bool:
-    t = (row_obj.get("_type") or "").strip().lower()
-    return t.startswith("a") or "access" in t
+    rel["_disp"] = [
+        _display_name(_safe_str(r.get(brand_col, "")), _safe_str(r.get(product_col, "")), lang)
+        for _, r in rel.iterrows()
+    ]
+    rel = rel.drop_duplicates(subset=["_disp"])
+
+    sort_cols = [c for c in ["RRP", "_disp"] if c in rel.columns]
+    if sort_cols:
+        rel = rel.sort_values(by=sort_cols)
+
+    if "Item_str" not in rel.columns and item_col in rel.columns:
+        rel["Item_str"] = (
+            rel[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+        )
+
+    out = []
+    for _, r in rel.iterrows():
+        allow = _allow_to_buy_val(r.get(allow_col) if allow_col else None)
+        rrp_val = None
+        if "RRP" in r and pd.notna(r["RRP"]):
+            try:
+                rrp_val = float(r["RRP"])
+            except Exception:
+                rrp_val = None
+
+        out.append({
+            "Department": _dept_label(r, lang),  # localized
+            "Brand": _brand_for_display(_safe_str(r.get(brand_col, "")), lang),
+            "Item Name (retek)": _safe_str(r.get("_disp", "")),
+            "Item Name": _safe_str(r.get("_disp", "")),
+            "RRP": rrp_val,
+            "Item": _safe_str(r.get("Item_str", "")),
+            "Allow To Buy": 1 if allow else 0,
+        })
+    return out
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/api/healthz")
 def health():
     return {"ok": True}
 
-@limiter.limit(RATE_LIMIT_META)
+@limiter.limit(os.getenv("RATE_LIMIT_META", "30/minute;1000/day"))
 @app.get("/api/meta")
 def api_meta():
-    try:
-        _ensure_data_loaded()
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "repo": DATA_REPO,
-            "path": DATA_PATH,
-            "sheet": DATA_SHEET,
-        }, 500
+    df = load_df()
+    lang = _norm_lang(request.args.get("lang"))
+    q_type = (request.args.get("type") or "").strip()
+    q_dept = (request.args.get("department") or "").strip()  # RAW value expected
+    q_brand = (request.args.get("brand") or "").strip()
 
-    return {
-        "ok": True,
-        "loaded_at": _cache["loaded_at"],
-        "row_count": len(_cache["rows"]),
-        "repo": DATA_REPO,
-        "path": DATA_PATH,
-        "sheet": DATA_SHEET,
-        "ref": DATA_REF,
-        "last_error": _cache["last_error"],
-    }
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
-@limiter.limit(RATE_LIMIT_SUGGEST)
+    filtered = df.copy()
+    if q_type and type_col in filtered.columns:
+        filtered = filtered[filtered[type_col] == q_type]
+    if q_dept and dept_col in filtered.columns:
+        filtered = filtered[filtered[dept_col] == q_dept]   # filter by RAW
+    if q_brand and brand_col in filtered.columns:
+        filtered = filtered[filtered[brand_col] == q_brand]
+
+    types = sorted(df[type_col].dropna().unique().tolist()) if type_col in df.columns else []
+
+    # departments: as [{value,label}] using merged mapping columns
+    departments = []
+    if dept_col in filtered.columns:
+        dept_raws = sorted(filtered[dept_col].dropna().astype(str).unique().tolist())
+        label_col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+        lab_map = {}
+        if label_col in df.columns and dept_col in df.columns:
+            pairs = df[[dept_col, label_col]].dropna().astype({dept_col: str})
+            lab_map = dict(zip(pairs[dept_col], pairs[label_col].fillna("").astype(str)))
+        for raw in dept_raws:
+            label = lab_map.get(raw) or raw
+            departments.append({"value": raw, "label": label})
+
+    brands = sorted(filtered[brand_col].dropna().astype(str).unique().tolist()) if brand_col in filtered.columns else []
+
+    item_names = []
+    if brand_col and product_col and q_type and q_dept and q_brand:
+        disp = [
+            _display_name(b, p, lang)
+            for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
+        ]
+        item_names = sorted(pd.Series(disp).dropna().astype(str).unique().tolist())[:MAX_ITEM_NAMES]
+
+    return jsonify({"types": types, "departments": departments, "brands": brands, "item_names": item_names})
+
+@limiter.limit(os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day"))
 @app.get("/api/suggest")
 def api_suggest():
-    q = request.args.get("q", "") or request.args.get("query", "") or request.args.get("term", "")
-    q = (q or "").strip()
+    q = (request.args.get("q") or "").strip()
     if not q:
-        return {"suggestions": []}
+        return jsonify({"suggestions": []})
+    ql = q.lower()
 
-    try:
-        _ensure_data_loaded()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    df = load_df()
+    lang = _norm_lang(request.args.get("lang"))
+    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
-    tokens = _tokenize(q)
-    if not tokens:
-        return {"suggestions": []}
+    q_type = (request.args.get("type") or "").strip()
+    q_dept = (request.args.get("department") or "").strip()
+    q_brand = (request.args.get("brand") or "").strip()
 
-    scored = []
-    for r in _cache["rows"]:
-        matched, quality = _score(r["_search"], tokens)
-        if matched >= 1:
-            scored.append((matched, quality, r["_label"]))
+    filtered = df.copy()
+    if q_type and type_col in filtered.columns:
+        filtered = filtered[filtered[type_col] == q_type]
+    if q_dept and dept_col in filtered.columns:
+        filtered = filtered[filtered[dept_col] == q_dept]
+    if q_brand and brand_col in filtered.columns:
+        filtered = filtered[filtered[brand_col] == q_brand]
 
-    # more parts matched => higher rank
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    if not (brand_col and product_col):
+        return jsonify({"suggestions": []})
 
-    out = []
-    seen = set()
-    for _, __, label in scored:
-        key = _norm(label)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(label)
-        if len(out) >= SUGGEST_LIMIT:
-            break
+    names = [
+        _display_name(b, p, lang)
+        for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
+    ]
+    names = pd.Series(names).dropna().astype(str).unique().tolist()
 
-    return {"suggestions": out}
+    def token_prefix_match(name: str) -> bool:
+        tokens = re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", name.lower())
+        return any(t.startswith(ql.lower()) for t in tokens if t)
 
-@limiter.limit(RATE_LIMIT_SEARCH)
+    matched = [n for n in names if token_prefix_match(n)]
+    matched = sorted(matched)[:MAX_SUGGESTIONS]
+    return jsonify({"suggestions": matched})
+
+@limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
 def api_search():
-    body = request.get_json(force=False, silent=True) or {}
-    action = (body.get("action") or "").strip().lower()
+    payload = request.get_json(force=True, silent=True) or {}
+    action = (payload.get("action") or "").strip()
+    lang = _norm_lang(payload.get("lang"))
 
-    try:
-        _ensure_data_loaded()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    df = load_df()
+    product_number = None
+    error = None
 
-    def find_by_sku(sku: str):
-        return _cache["by_sku"].get(str(sku or "").strip())
-
-    def find_by_label(label: str):
-        return _cache["by_label"].get(_norm(label or ""))
-
-    # --- resolve "selected" row ---
-    selected = None
-
-    if action == "number":
-        selected = find_by_sku(body.get("product_number"))
+    if action == "dropdown":
+        name = (payload.get("selected_item_name") or "").strip()
+        if not name:
+            error = "Please select the product."
+        else:
+            match = _match_by_display_name(df, name, lang)
+            if match.empty:
+                error = "No match found for the selected product."
+            else:
+                item_col = _get_col(match, "ITEM", "Item")
+                sku_raw = str(match.iloc[0].get(item_col, "")).replace(".0", "") if item_col else ""
+                product_number = sku_raw.zfill(8)
 
     elif action == "link":
-        link = str(body.get("product_link") or "")
-        m = re.search(r"(\d{8})", link)
-        if m:
-            selected = find_by_sku(m.group(1))
+        link = (payload.get("product_link") or "").strip()
+        if not (link.startswith("http://") or link.startswith("https://")):
+            error = "Please enter a valid product link."
+        else:
+            sku = extract_sku_from_url(link)
+            if sku:
+                product_number = sku
+            else:
+                error = "Please enter a valid product link."
 
-    elif action == "dropdown":
-        selected = find_by_label(body.get("selected_item_name"))
-        # fallback: broad match if label not found
-        if not selected:
-            q = str(body.get("selected_item_name") or "")
-            tokens = _tokenize(q)
-            best = None
-            for r in _cache["rows"]:
-                matched, quality = _score(r["_search"], tokens)
-                if matched < 1:
-                    continue
-                cand = (matched, quality, r)
-                if best is None or (cand[0], cand[1]) > (best[0], best[1]):
-                    best = cand
-            selected = best[2] if best else None
-
+    elif action == "number":
+        if NUMBER_SEARCH_DELAY_MS > 0:
+            time.sleep(NUMBER_SEARCH_DELAY_MS / 1000.0)
+        num = (payload.get("product_number") or "").strip()
+        if not num.isdigit() or len(num) != 8:
+            error = "Please enter an 8-digit product number."
+        else:
+            product_number = num
     else:
-        # generic text search
-        q = str(body.get("q") or body.get("query") or body.get("term") or "")
-        tokens = _tokenize(q)
-        best = None
-        for r in _cache["rows"]:
-            matched, quality = _score(r["_search"], tokens)
-            if matched < 1:
-                continue
-            cand = (matched, quality, r)
-            if best is None or (cand[0], cand[1]) > (best[0], best[1]):
-                best = cand
-        selected = best[2] if best else None
+        error = "Invalid action."
 
-    if not selected:
-        return jsonify({"error": "No item found"}), 404
+    if error:
+        return jsonify({"error": error}), 400
 
-    # --- build related items (only if your Excel has a usable core link column) ---
-    related = []
-    core_ref = (selected.get("_core") or "").strip()
-    sku = (selected.get("_sku") or "").strip()
+    if "Item_str" not in df.columns:
+        item_col = _get_col(df, "ITEM", "Item")
+        if item_col:
+            df["Item_str"] = (
+                df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+            )
+    match = df[df["Item_str"] == product_number]
+    if match.empty:
+        return jsonify({"error": f"Product {product_number} not found."}), 404
 
-    if core_ref:
-        # if accessory points to a core, return that core
-        core_row = find_by_sku(core_ref)
-        if core_row:
-            related = [_related_payload(core_row)]
-    else:
-        # if it's a core, return accessories that point to it
-        rel_rows = _cache["by_core"].get(sku, [])
-        related = [_related_payload(r) for r in rel_rows]
+    row = match.iloc[0]
+    result = _row_to_result(row, lang)
+    related = _related_items(df, row, lang)
+    return jsonify({"result": result, "related_items": related})
 
-    return {
-        "result": _result_payload(selected),
-        "related_items": related,
-    }
-
-@limiter.limit(RATE_LIMIT_REFRESH)
+@limiter.limit(os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day"))
 @app.post("/api/refresh")
 def api_refresh():
-    if API_REFRESH_TOKEN:
-        auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {API_REFRESH_TOKEN}":
-            return jsonify({"error": "unauthorized"}), 401
-
-    try:
-        _load_excel_into_cache(force=True)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    return {"ok": True, "loaded_at": _cache["loaded_at"], "row_count": len(_cache["rows"])}
+    auth = request.headers.get("Authorization", "")
+    if not API_REFRESH_TOKEN or auth != f"Bearer {API_REFRESH_TOKEN}":
+        return jsonify({"error": "unauthorized"}), 401
+    load_df(force=True)
+    return jsonify({"ok": True, "message": "Data cache refreshed."})
 
 @app.errorhandler(429)
 def _ratelimit_handler(e):
