@@ -439,11 +439,28 @@ def api_suggest():
     ]
     names = pd.Series(names).dropna().astype(str).unique().tolist()
 
-    def token_prefix_match(name: str) -> bool:
-        tokens = re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", name.lower())
-        return any(t.startswith(ql.lower()) for t in tokens if t)
+    # Broad match for free-text input:
+    # - Split the query into tokens (e.g. "philips toothbrush" -> ["philips", "toothbrush"])
+    # - A name matches if *every* query token matches somewhere in the name (order-independent).
+    def _tokenize(s: str) -> list[str]:
+        return [t for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower()) if t]
 
-    matched = [n for n in names if token_prefix_match(n)]
+    q_tokens = _tokenize(q)
+    if not q_tokens:
+        return jsonify({"suggestions": []})
+
+    def broad_match(name: str) -> bool:
+        name_l = (name or "").lower()
+        name_tokens = _tokenize(name_l)
+        for qt in q_tokens:
+            if qt in name_l:
+                continue
+            if any(nt.startswith(qt) or qt in nt for nt in name_tokens):
+                continue
+            return False
+        return True
+
+    matched = [n for n in names if broad_match(n)]
     matched = sorted(matched)[:MAX_SUGGESTIONS]
     return jsonify({"suggestions": matched})
 
