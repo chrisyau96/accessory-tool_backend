@@ -45,6 +45,7 @@ API_REFRESH_TOKEN = os.getenv("API_REFRESH_TOKEN", "")
 MAX_ITEM_NAMES = int(os.getenv("MAX_ITEM_NAMES", "200"))
 MAX_SUGGESTIONS = int(os.getenv("MAX_SUGGESTIONS", "20"))
 NUMBER_SEARCH_DELAY_MS = int(os.getenv("NUMBER_SEARCH_DELAY_MS", "250"))
+SCROLL_OFFSET_PX = int(os.getenv("SCROLL_OFFSET_PX", "160"))
 
 # ── Security / Origins ───────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
@@ -237,7 +238,6 @@ def _dept_label(row_like, lang: str) -> str:
     row_like: Series or DataFrame row with mapping columns
     """
     col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
-    # try localized, fallback raw
     lbl = _safe_str(row_like.get(col)) if hasattr(row_like, "get") else ""
     if lbl:
         return lbl
@@ -280,7 +280,7 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
     brand_raw = _safe_str(_get_series(row, brand_col))
     product_raw = _safe_str(_get_series(row, product_col))
     dept_raw = _safe_str(_get_series(row, dept_col))
-    dept_disp = _dept_label(row, lang)  # localized label
+    dept_disp = _dept_label(row, lang)
 
     item_type = _safe_str(_get_series(row, type_col))
     type_label = "Accessory" if item_type == "A" else "Core Item"
@@ -303,8 +303,8 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
         "item_name_retek": item_name_disp,
         "item_name": item_name_disp,
         "brand": brand_disp,
-        "department": dept_disp,       # localized
-        "department_raw": dept_raw,    # raw (handy if needed)
+        "department": dept_disp,
+        "department_raw": dept_raw,
         "item_type": item_type,
         "type_label": type_label,
         "rrp": rrp,
@@ -345,7 +345,7 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
                 rrp_val = None
 
         out.append({
-            "Department": _dept_label(r, lang),  # localized
+            "Department": _dept_label(r, lang),
             "Brand": _brand_for_display(_safe_str(r.get(brand_col, "")), lang),
             "Item Name (retek)": _safe_str(r.get("_disp", "")),
             "Item Name": _safe_str(r.get("_disp", "")),
@@ -366,7 +366,7 @@ def api_meta():
     df = load_df()
     lang = _norm_lang(request.args.get("lang"))
     q_type = (request.args.get("type") or "").strip()
-    q_dept = (request.args.get("department") or "").strip()  # RAW value expected
+    q_dept = (request.args.get("department") or "").strip()
     q_brand = (request.args.get("brand") or "").strip()
 
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
@@ -375,13 +375,12 @@ def api_meta():
     if q_type and type_col in filtered.columns:
         filtered = filtered[filtered[type_col] == q_type]
     if q_dept and dept_col in filtered.columns:
-        filtered = filtered[filtered[dept_col] == q_dept]   # filter by RAW
+        filtered = filtered[filtered[dept_col] == q_dept]
     if q_brand and brand_col in filtered.columns:
         filtered = filtered[filtered[brand_col] == q_brand]
 
     types = sorted(df[type_col].dropna().unique().tolist()) if type_col in df.columns else []
 
-    # departments: as [{value,label}] using merged mapping columns
     departments = []
     if dept_col in filtered.columns:
         dept_raws = sorted(filtered[dept_col].dropna().astype(str).unique().tolist())
@@ -406,7 +405,6 @@ def api_meta():
 
     return jsonify({"types": types, "departments": departments, "brands": brands, "item_names": item_names})
 
-@limiter.limit(os.getenv("RATE_LIMIT_SUGGEST", "60/minute;1500/day"))
 @app.get("/api/suggest")
 def api_suggest():
     q = (request.args.get("q") or "").strip()
@@ -416,7 +414,11 @@ def api_suggest():
     df = load_df()
     lang = _norm_lang(request.args.get("lang"))
 
+    # Current-language columns (output language)
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+
+    # English columns (secondary matching surface)
+    brand_col_en, product_col_en, *_ = _select_cols(df, "en")
 
     q_type = (request.args.get("type") or "").strip()
     q_dept = (request.args.get("department") or "").strip()
@@ -427,14 +429,18 @@ def api_suggest():
         filtered = filtered[filtered[type_col] == q_type]
     if q_dept and dept_col in filtered.columns:
         filtered = filtered[filtered[dept_col] == q_dept]
-    if q_brand and brand_col in filtered.columns:
-        filtered = filtered[filtered[brand_col] == q_brand]
 
-    # English columns (used as an additional matching surface when site language is not English)
-    brand_col_en, product_col_en, *_ = _select_cols(filtered, "en")
+    # Brand filter: prefer current-language brand column; fallback to English if needed
+    if q_brand:
+        if brand_col and brand_col in filtered.columns:
+            filtered = filtered[filtered[brand_col] == q_brand]
+        elif brand_col_en and brand_col_en in filtered.columns:
+            filtered = filtered[filtered[brand_col_en] == q_brand]
 
-    # If neither current language nor English name columns exist, we cannot suggest.
-    if not ((brand_col and product_col) or (brand_col_en and product_col_en)):
+    # If we have neither a current-language name nor an English name, we can't suggest.
+    have_lang_name = bool(brand_col and product_col and brand_col in filtered.columns and product_col in filtered.columns)
+    have_en_name = bool(brand_col_en and product_col_en and brand_col_en in filtered.columns and product_col_en in filtered.columns)
+    if not have_lang_name and not have_en_name:
         return jsonify({"suggestions": []})
 
     disp_lang = (
@@ -442,7 +448,7 @@ def api_suggest():
             _display_name(b, p, lang)
             for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
         ]
-        if (brand_col and product_col)
+        if have_lang_name
         else [""] * len(filtered)
     )
 
@@ -451,14 +457,14 @@ def api_suggest():
             _display_name(b, p, "en")
             for b, p in zip(filtered.get(brand_col_en), filtered.get(product_col_en))
         ]
-        if (brand_col_en and product_col_en)
+        if have_en_name
         else [""] * len(filtered)
     )
 
     # Broad match:
-    # - Split the query into tokens (e.g. "philips toothbrush" -> ["philips", "toothbrush"])
-    # - A candidate matches if *every* query token matches somewhere in the candidate (order-independent).
-    # - Uses prefix/contains checks to support partial typing (e.g. "tooth" matches "toothbrush").
+    # - Split query into tokens; all tokens must match (order-independent).
+    # - Matches on either the localized display name OR the English display name.
+    # - Supports partial typing + "compacted" contains (so "toothbrush" matches "tooth brush").
     def _tokenize(s: str) -> list[str]:
         return [
             t
@@ -466,22 +472,37 @@ def api_suggest():
             if t
         ]
 
+    def _compact(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", "", (s or "").lower())
+
     q_tokens = _tokenize(q)
     if not q_tokens:
         return jsonify({"suggestions": []})
 
+    q_compact = _compact(q)
+
     def _broad_match(candidate: str) -> bool:
-        cand = (candidate or "").lower()
+        cand = (candidate or "").strip()
         if not cand:
             return False
-        cand_tokens = _tokenize(cand)
+        cand_l = cand.lower()
+        cand_tokens = _tokenize(cand_l)
+        cand_compact = _compact(cand_l)
+
         for qt in q_tokens:
-            # quick substring check
-            if qt in cand:
+            if qt in cand_l:
                 continue
-            # token-level check
+
+            qt_compact = _compact(qt)
+            if qt_compact and qt_compact in cand_compact:
+                continue
+
             if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
                 continue
+
+            if q_compact and q_compact in cand_compact:
+                continue
+
             return False
         return True
 
@@ -492,20 +513,17 @@ def api_suggest():
         dl = (dl or "").strip()
         de = (de or "").strip()
 
-        # Match against current-language *and* English name.
-        # Example: when lang is zh-hk, typing "toothbrush" can still surface results,
-        # and we return the zh-hk display name (if available).
+        # Match against localized + English. Return localized when available.
         if not (_broad_match(dl) or _broad_match(de)):
             continue
 
-        out = dl or de  # prefer localized display name
+        out = dl or de
         if out and out not in seen:
             seen.add(out)
             suggestions.append(out)
 
     suggestions = sorted(suggestions)[:MAX_SUGGESTIONS]
     return jsonify({"suggestions": suggestions})
-
 
 @limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
@@ -569,7 +587,10 @@ def api_search():
     row = match.iloc[0]
     result = _row_to_result(row, lang)
     related = _related_items(df, row, lang)
-    return jsonify({"result": result, "related_items": related})
+    resp = {"result": result, "related_items": related}
+    if action == "dropdown":
+        resp["scroll_hint"] = {"mode": "scrollBy", "px": SCROLL_OFFSET_PX}
+    return jsonify(resp)
 
 @limiter.limit(os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day"))
 @app.post("/api/refresh")
