@@ -182,8 +182,14 @@ LANG_BRAND_MAP = {"en": "BRAND_NAME_EN", "tc": "BRAND_NAME_TC", "sc": "BRAND_NAM
 LANG_PRODUCT_MAP = {"en": "PRODUCT_NAME_EN", "tc": "PRODUCT_NAME_TC", "sc": "PRODUCT_NAME_SC"}
 
 def _norm_lang(s: str | None) -> str:
-    s = (s or "en").lower()
-    return "tc" if s == "zh-hk" else "sc" if s == "zh-cn" else ("en" if s not in ("en","tc","sc") else s)
+    s = (s or "en").strip().lower().replace("_", "-")
+    if s in ("zh-hk", "tc"):
+        return "tc"
+    if s in ("zh-cn", "sc"):
+        return "sc"
+    if s in ("en", "tc", "sc"):
+        return s
+    return "en"
 
 def _safe_str(v) -> str:
     """Return '' for NaN/None, else str(v)."""
@@ -414,15 +420,12 @@ def api_suggest():
     df = load_df()
     lang = _norm_lang(request.args.get("lang"))
 
-    # Current-language columns (output language)
-    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
-
-    # English columns (secondary matching surface)
-    brand_col_en, product_col_en, *_ = _select_cols(df, "en")
-
     q_type = (request.args.get("type") or "").strip()
     q_dept = (request.args.get("department") or "").strip()
     q_brand = (request.args.get("brand") or "").strip()
+
+    # Filter by type/department first (same as current behavior)
+    brand_col_lang, product_col_lang, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
     if q_type and type_col in filtered.columns:
@@ -430,41 +433,40 @@ def api_suggest():
     if q_dept and dept_col in filtered.columns:
         filtered = filtered[filtered[dept_col] == q_dept]
 
-    # Brand filter: prefer current-language brand column; fallback to English if needed
+    # Brand filter (best-effort across all languages so filters still work even if caller passes other language)
     if q_brand:
-        if brand_col and brand_col in filtered.columns:
-            filtered = filtered[filtered[brand_col] == q_brand]
-        elif brand_col_en and brand_col_en in filtered.columns:
-            filtered = filtered[filtered[brand_col_en] == q_brand]
+        masks = []
+        for l in ("en", "tc", "sc"):
+            bcol, *_ = _select_cols(filtered, l)
+            if bcol and bcol in filtered.columns:
+                ser = filtered[bcol].fillna("").astype(str).str.strip()
+                masks.append(ser == q_brand)
+        if masks:
+            any_mask = pd.concat(masks, axis=1).any(axis=1)
+            filtered = filtered[any_mask]
 
-    # If we have neither a current-language name nor an English name, we can't suggest.
-    have_lang_name = bool(brand_col and product_col and brand_col in filtered.columns and product_col in filtered.columns)
-    have_en_name = bool(brand_col_en and product_col_en and brand_col_en in filtered.columns and product_col_en in filtered.columns)
-    if not have_lang_name and not have_en_name:
+    # Build display names for all 3 languages so query can match in *any* language,
+    # while we still return suggestions in the requested output language (lang).
+    disp = {}
+    have = {}
+    n = len(filtered)
+
+    for l in ("en", "tc", "sc"):
+        bcol, pcol, *_ = _select_cols(filtered, l)
+        have[l] = bool(bcol and pcol and bcol in filtered.columns and pcol in filtered.columns)
+        if have[l]:
+            disp[l] = [
+                _display_name(b, p, l)
+                for b, p in zip(filtered.get(bcol), filtered.get(pcol))
+            ]
+        else:
+            disp[l] = [""] * n
+
+    # If we don't have the output language columns, we can't return localized suggestions reliably.
+    if not have.get(lang, False):
         return jsonify({"suggestions": []})
 
-    disp_lang = (
-        [
-            _display_name(b, p, lang)
-            for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
-        ]
-        if have_lang_name
-        else [""] * len(filtered)
-    )
-
-    disp_en = (
-        [
-            _display_name(b, p, "en")
-            for b, p in zip(filtered.get(brand_col_en), filtered.get(product_col_en))
-        ]
-        if have_en_name
-        else [""] * len(filtered)
-    )
-
-    # Broad match:
-    # - Split query into tokens; all tokens must match (order-independent).
-    # - Matches on either the localized display name OR the English display name.
-    # - Supports partial typing + "compacted" contains (so "toothbrush" matches "tooth brush").
+    # Broad match helpers
     def _tokenize(s: str) -> list[str]:
         return [
             t
@@ -490,16 +492,20 @@ def api_suggest():
         cand_compact = _compact(cand_l)
 
         for qt in q_tokens:
+            # Direct substring
             if qt in cand_l:
                 continue
 
+            # Compacted substring (handles "toothbrush" vs "tooth brush")
             qt_compact = _compact(qt)
             if qt_compact and qt_compact in cand_compact:
                 continue
 
+            # Token-wise partials
             if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
                 continue
 
+            # Whole-query compact (handles multi-token typed queries)
             if q_compact and q_compact in cand_compact:
                 continue
 
@@ -509,16 +515,19 @@ def api_suggest():
     suggestions = []
     seen = set()
 
-    for dl, de in zip(disp_lang, disp_en):
-        dl = (dl or "").strip()
-        de = (de or "").strip()
+    # Match query against any-language names, but return the suggestion in the requested language.
+    for dl, de, dtc, dsc in zip(disp[lang], disp["en"], disp["tc"], disp["sc"]):
+        out = (dl or "").strip()
 
-        # Match against localized + English. Return localized when available.
-        if not (_broad_match(dl) or _broad_match(de)):
+        # Always return suggestions in the requested output language to keep dropdown search stable.
+        if not out:
             continue
 
-        out = dl or de
-        if out and out not in seen:
+        # Match surface: any of the language strings (whichever exist)
+        if not (_broad_match(de) or _broad_match(dtc) or _broad_match(dsc) or _broad_match(dl)):
+            continue
+
+        if out not in seen:
             seen.add(out)
             suggestions.append(out)
 
