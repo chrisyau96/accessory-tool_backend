@@ -50,6 +50,8 @@ MAX_SUGGESTIONS = int(os.getenv("MAX_SUGGESTIONS", "20"))
 NUMBER_SEARCH_DELAY_MS = int(os.getenv("NUMBER_SEARCH_DELAY_MS", "250"))
 SCROLL_OFFSET_PX = int(os.getenv("SCROLL_OFFSET_PX", "160"))
 
+ALL_LANGS = ("en", "tc", "sc")
+
 # ── Security / Origins ───────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
     try:
@@ -104,7 +106,7 @@ def _security_headers(resp):
 # ── Column helpers ───────────────────────────────────────────────────────────
 def _get_series(row, *names):
     for n in names:
-        if n in row:
+        if n and n in row:
             return row.get(n)
     return None
 
@@ -138,7 +140,7 @@ def _clean_text_series(series: pd.Series) -> pd.Series:
 
 def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply updated preprocessing rules to the master dataset:
+    Apply preprocessing rules:
       1. Keep only BUNDLE_TYPE = Consumable
       2. Exclude rows where EXCLUSION = Y
       3. Build Item_str as zero-padded 8-digit SKU
@@ -203,7 +205,6 @@ def load_df(force: bool = False) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     df = _post_load_normalize(df)
 
-    # Merge department mapping on ITEM_DEPT_NAME
     df_map = _load_dept_mapping()
     if "ITEM_DEPT_NAME" in df.columns and not df_map.empty:
         df["ITEM_DEPT_NAME"] = df["ITEM_DEPT_NAME"].astype(str).str.strip()
@@ -294,8 +295,37 @@ def _display_name(brand, product, lang: str) -> str:
 
 
 def _brand_for_display(brand, lang: str) -> str:
-    b = _safe_str(brand)
+    b = _safe_str(brand).strip()
     return _cap_words_en(b) if lang == "en" else b
+
+
+def _lang_order(preferred_lang: str):
+    return [preferred_lang] + [l for l in ALL_LANGS if l != preferred_lang]
+
+
+def _display_name_fallback(row_like, preferred_lang: str) -> str:
+    """
+    Return display name in preferred language if available.
+    If blank, fall back to the other languages.
+    """
+    for lang in _lang_order(preferred_lang):
+        brand_col = LANG_BRAND_MAP.get(lang)
+        product_col = LANG_PRODUCT_MAP.get(lang)
+        brand = _safe_str(row_like.get(brand_col)).strip() if hasattr(row_like, "get") else ""
+        product = _safe_str(row_like.get(product_col)).strip() if hasattr(row_like, "get") else ""
+        disp = _display_name(brand, product, lang).strip()
+        if disp:
+            return disp
+    return ""
+
+
+def _brand_fallback(row_like, preferred_lang: str) -> str:
+    for lang in _lang_order(preferred_lang):
+        brand_col = LANG_BRAND_MAP.get(lang)
+        brand = _safe_str(row_like.get(brand_col)).strip() if hasattr(row_like, "get") else ""
+        if brand:
+            return _brand_for_display(brand, lang)
+    return ""
 
 
 def _allow_to_buy_val(val) -> int:
@@ -317,6 +347,81 @@ def _dept_label(row_like, lang: str) -> str:
         return lbl
 
     return _safe_str(row_like.get("ITEM_DEPT_NAME")) if hasattr(row_like, "get") else ""
+
+
+def _normalize_type_value(v: str) -> str:
+    x = (v or "").strip().upper()
+    if x in ("A", "ACCESSORY"):
+        return "A"
+    if x in ("C", "CORE", "CORE ITEM"):
+        return "C"
+    return x
+
+
+def _apply_type_filter(df: pd.DataFrame, q_type: str, type_col: str | None) -> pd.DataFrame:
+    if not q_type or not type_col or type_col not in df.columns:
+        return df
+
+    q_norm = _normalize_type_value(q_type)
+    ser = _clean_text_series(df[type_col]).str.upper()
+
+    if q_norm == "A":
+        return df[ser.isin(["A", "ACCESSORY"])]
+
+    if q_norm == "C":
+        return df[ser.isin(["C", "CORE ITEM", "CORE"])]
+
+    return df[ser == q_norm]
+
+
+def _brand_mask(df: pd.DataFrame, q_brand: str) -> pd.Series:
+    if not q_brand:
+        return pd.Series([True] * len(df), index=df.index)
+
+    q_brand_norm = q_brand.strip().lower()
+    masks = []
+
+    for lang in ALL_LANGS:
+        bcol = LANG_BRAND_MAP.get(lang)
+        if bcol and bcol in df.columns:
+            masks.append(df[bcol].fillna("").astype(str).str.strip().str.lower() == q_brand_norm)
+
+    if not masks:
+        return pd.Series([True] * len(df), index=df.index)
+
+    return pd.concat(masks, axis=1).any(axis=1)
+
+
+def _collect_search_values(row_like) -> list[str]:
+    vals = []
+
+    for lang in ALL_LANGS:
+        brand_col = LANG_BRAND_MAP.get(lang)
+        product_col = LANG_PRODUCT_MAP.get(lang)
+
+        brand = _safe_str(row_like.get(brand_col)).strip() if hasattr(row_like, "get") else ""
+        product = _safe_str(row_like.get(product_col)).strip() if hasattr(row_like, "get") else ""
+
+        if brand:
+            vals.append(brand)
+        if product:
+            vals.append(product)
+
+        disp = _display_name(brand, product, lang).strip()
+        if disp:
+            vals.append(disp)
+
+    item_str = _safe_str(row_like.get("Item_str")).strip() if hasattr(row_like, "get") else ""
+    if item_str:
+        vals.append(item_str)
+
+    seen = set()
+    out = []
+    for v in vals:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
 
 
 # ── Column selection usable for DataFrame *or* Series ────────────────────────
@@ -345,28 +450,24 @@ def _select_cols(df_like, lang: str):
 
 # ── Builders ─────────────────────────────────────────────────────────────────
 def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
-    brand_col, product_col, *_ = _select_cols(df, lang)
-    if not (brand_col and product_col):
+    if df.empty:
         return pd.DataFrame()
 
-    tmp = df[[c for c in (brand_col, product_col) if c in df.columns]].copy()
-    tmp["_disp"] = [
-        _display_name(b, p, lang)
-        for b, p in zip(tmp.get(brand_col), tmp.get(product_col))
-    ]
-    return df[tmp["_disp"] == name]
+    tmp = df.copy()
+    tmp["_disp"] = [_display_name_fallback(r, lang) for _, r in tmp.iterrows()]
+    return tmp[tmp["_disp"] == name]
 
 
 def _row_to_result(row: pd.Series, lang: str) -> dict:
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
 
-    brand_raw = _safe_str(_get_series(row, brand_col))
-    product_raw = _safe_str(_get_series(row, product_col))
     dept_raw = _safe_str(_get_series(row, dept_col))
     dept_disp = _dept_label(row, lang)
 
-    item_type = _safe_str(_get_series(row, type_col))
-    type_label = "Accessory" if item_type == "A" else "Core Item"
+    item_type = _safe_str(_get_series(row, type_col)).strip()
+    item_type_norm = _normalize_type_value(item_type)
+    type_label = "Accessory" if item_type_norm == "A" else "Core Item"
+
     item = _safe_str(_get_series(row, "Item_str"))
     allow = _allow_to_buy_val(_get_series(row, allow_col) if allow_col else None)
 
@@ -378,8 +479,8 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
         except Exception:
             rrp = None
 
-    brand_disp = _brand_for_display(brand_raw, lang)
-    item_name_disp = _display_name(brand_raw, product_raw, lang)
+    brand_disp = _brand_fallback(row, lang)
+    item_name_disp = _display_name_fallback(row, lang)
 
     return {
         "item": item,
@@ -401,13 +502,17 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
     if not (bundle_col and type_col) or pd.isna(row.get(bundle_col)):
         return []
 
-    opposite_type = "C" if row.get(type_col) == "A" else "A"
-    rel = df[(df[bundle_col] == row.get(bundle_col)) & (df[type_col] == opposite_type)].copy()
+    row_type_norm = _normalize_type_value(_safe_str(row.get(type_col)))
+    opposite_type = "C" if row_type_norm == "A" else "A"
 
-    rel["_disp"] = [
-        _display_name(_safe_str(r.get(brand_col, "")), _safe_str(r.get(product_col, "")), lang)
-        for _, r in rel.iterrows()
-    ]
+    rel_type_ser = _clean_text_series(df[type_col]).str.upper()
+    if opposite_type == "A":
+        rel = df[(df[bundle_col] == row.get(bundle_col)) & (rel_type_ser.isin(["A", "ACCESSORY"]))].copy()
+    else:
+        rel = df[(df[bundle_col] == row.get(bundle_col)) & (rel_type_ser.isin(["C", "CORE ITEM", "CORE"]))].copy()
+
+    rel["_disp"] = [_display_name_fallback(r, lang) for _, r in rel.iterrows()]
+    rel = rel[rel["_disp"].astype(str).str.strip() != ""]
     rel = rel.drop_duplicates(subset=["_disp"])
 
     sort_cols = [c for c in ["RRP", "_disp"] if c in rel.columns]
@@ -436,7 +541,7 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
 
         out.append({
             "Department": _dept_label(r, lang),
-            "Brand": _brand_for_display(_safe_str(r.get(brand_col, "")), lang),
+            "Brand": _brand_fallback(r, lang),
             "Item Name (retek)": _safe_str(r.get("_disp", "")),
             "Item Name": _safe_str(r.get("_disp", "")),
             "RRP": rrp_val,
@@ -466,18 +571,27 @@ def api_meta():
 
     filtered = df.copy()
 
-    if q_type and type_col in filtered.columns:
-        filtered = filtered[filtered[type_col] == q_type]
-    if q_dept and dept_col in filtered.columns:
-        filtered = filtered[filtered[dept_col] == q_dept]
-    if q_brand and brand_col in filtered.columns:
-        filtered = filtered[filtered[brand_col] == q_brand]
+    filtered = _apply_type_filter(filtered, q_type, type_col)
 
-    types = sorted(df[type_col].dropna().unique().tolist()) if type_col in df.columns else []
+    if q_dept and dept_col in filtered.columns:
+        filtered = filtered[filtered[dept_col].fillna("").astype(str).str.strip() == q_dept]
+
+    if q_brand:
+        filtered = filtered[_brand_mask(filtered, q_brand)]
+
+    types = []
+    if type_col in df.columns:
+        type_vals = _clean_text_series(df[type_col]).str.upper()
+        normalized_types = []
+        for v in type_vals.unique().tolist():
+            nv = _normalize_type_value(v)
+            if nv and nv not in normalized_types:
+                normalized_types.append(nv)
+        types = sorted(normalized_types)
 
     departments = []
     if dept_col in filtered.columns:
-        dept_raws = sorted(filtered[dept_col].dropna().astype(str).unique().tolist())
+        dept_raws = sorted(filtered[dept_col].dropna().astype(str).str.strip().unique().tolist())
         label_col = {
             "en": "ITEM_DEPT_NAME_EN",
             "tc": "ITEM_DEPT_NAME_TC",
@@ -486,22 +600,32 @@ def api_meta():
 
         lab_map = {}
         if label_col in df.columns and dept_col in df.columns:
-            pairs = df[[dept_col, label_col]].dropna().astype({dept_col: str})
-            lab_map = dict(zip(pairs[dept_col], pairs[label_col].fillna("").astype(str)))
+            base = df[[dept_col, label_col]].copy()
+            base[dept_col] = base[dept_col].fillna("").astype(str).str.strip()
+            base[label_col] = base[label_col].fillna("").astype(str).str.strip()
+            base = base[base[dept_col] != ""]
+            for _, r in base.iterrows():
+                raw = r[dept_col]
+                lbl = r[label_col] or raw
+                if raw not in lab_map:
+                    lab_map[raw] = lbl
 
         for raw in dept_raws:
-            label = lab_map.get(raw) or raw
-            departments.append({"value": raw, "label": label})
+            departments.append({"value": raw, "label": lab_map.get(raw) or raw})
 
-    brands = sorted(filtered[brand_col].dropna().astype(str).unique().tolist()) if brand_col in filtered.columns else []
+    brands = []
+    if not filtered.empty:
+        brand_vals = []
+        for _, r in filtered.iterrows():
+            b = _brand_fallback(r, lang)
+            if b:
+                brand_vals.append(b)
+        brands = sorted(pd.Series(brand_vals).dropna().astype(str).unique().tolist())
 
     item_names = []
-    if brand_col and product_col and q_type and q_dept and q_brand:
-        disp = [
-            _display_name(b, p, lang)
-            for b, p in zip(filtered.get(brand_col), filtered.get(product_col))
-        ]
-        item_names = sorted(pd.Series(disp).dropna().astype(str).unique().tolist())[:MAX_ITEM_NAMES]
+    if q_type and q_dept and q_brand and not filtered.empty:
+        disp = [_display_name_fallback(r, lang) for _, r in filtered.iterrows()]
+        item_names = sorted(pd.Series(disp).dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())[:MAX_ITEM_NAMES]
 
     return jsonify({
         "types": types,
@@ -528,41 +652,15 @@ def api_suggest():
 
     filtered = df.copy()
 
-    if q_type and type_col in filtered.columns:
-        filtered = filtered[filtered[type_col] == q_type]
+    filtered = _apply_type_filter(filtered, q_type, type_col)
+
     if q_dept and dept_col in filtered.columns:
-        filtered = filtered[filtered[dept_col] == q_dept]
+        filtered = filtered[filtered[dept_col].fillna("").astype(str).str.strip() == q_dept]
 
-    # Brand filter across all languages
     if q_brand:
-        masks = []
-        for l in ("en", "tc", "sc"):
-            bcol, *_ = _select_cols(filtered, l)
-            if bcol and bcol in filtered.columns:
-                ser = filtered[bcol].fillna("").astype(str).str.strip()
-                masks.append(ser == q_brand)
+        filtered = filtered[_brand_mask(filtered, q_brand)]
 
-        if masks:
-            any_mask = pd.concat(masks, axis=1).any(axis=1)
-            filtered = filtered[any_mask]
-
-    disp = {}
-    have = {}
-    n = len(filtered)
-
-    for l in ("en", "tc", "sc"):
-        bcol, pcol, *_ = _select_cols(filtered, l)
-        have[l] = bool(bcol and pcol and bcol in filtered.columns and pcol in filtered.columns)
-
-        if have[l]:
-            disp[l] = [
-                _display_name(b, p, l)
-                for b, p in zip(filtered.get(bcol), filtered.get(pcol))
-            ]
-        else:
-            disp[l] = [""] * n
-
-    if not have.get(lang, False):
+    if filtered.empty:
         return jsonify({"suggestions": []})
 
     def _tokenize(s: str) -> list[str]:
@@ -611,15 +709,13 @@ def api_suggest():
     suggestions = []
     seen = set()
 
-    for dl, de, dtc, dsc in zip(disp[lang], disp["en"], disp["tc"], disp["sc"]):
-        out = (dl or "").strip()
-        if not out:
+    for _, row in filtered.iterrows():
+        out = _display_name_fallback(row, lang).strip()
+        if not out or out in seen:
             continue
 
-        if not (_broad_match(de) or _broad_match(dtc) or _broad_match(dsc) or _broad_match(dl)):
-            continue
-
-        if out not in seen:
+        search_values = _collect_search_values(row)
+        if any(_broad_match(v) for v in search_values):
             seen.add(out)
             suggestions.append(out)
 
