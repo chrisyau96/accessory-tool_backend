@@ -72,9 +72,13 @@ def _origin_allowed() -> bool:
 
     if origin:
         return _normalize_origin(origin) in ALLOWED_ORIGINS
+
     if ref:
         return _normalize_origin(ref) in ALLOWED_ORIGINS
-    return False
+
+    # Important for mobile app / Android WebView:
+    # some environments do not send Origin or Referer.
+    return True
 
 
 @app.before_request
@@ -116,6 +120,21 @@ def _get_col(df, *names):
         if n in df.columns:
             return n
     return None
+
+
+def _safe_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v)
+
+
+def _normalize_display_text(s: str) -> str:
+    return re.sub(r"\s+", " ", _safe_str(s)).strip().casefold()
 
 
 # ── Data access ──────────────────────────────────────────────────────────────
@@ -246,17 +265,6 @@ def _norm_lang(s: str | None) -> str:
     return "en"
 
 
-def _safe_str(v) -> str:
-    if v is None:
-        return ""
-    try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    return str(v)
-
-
 def _cap_words_en(brand: str) -> str:
     if not brand:
         return brand
@@ -304,10 +312,6 @@ def _lang_order(preferred_lang: str):
 
 
 def _display_name_fallback(row_like, preferred_lang: str) -> str:
-    """
-    Return display name in preferred language if available.
-    If blank, fall back to the other languages.
-    """
     for lang in _lang_order(preferred_lang):
         brand_col = LANG_BRAND_MAP.get(lang)
         product_col = LANG_PRODUCT_MAP.get(lang)
@@ -453,9 +457,13 @@ def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFra
     if df.empty:
         return pd.DataFrame()
 
+    target = _normalize_display_text(name)
+
     tmp = df.copy()
     tmp["_disp"] = [_display_name_fallback(r, lang) for _, r in tmp.iterrows()]
-    return tmp[tmp["_disp"] == name]
+    tmp["_disp_key"] = tmp["_disp"].map(_normalize_display_text)
+
+    return tmp[tmp["_disp_key"] == target]
 
 
 def _row_to_result(row: pd.Series, lang: str) -> dict:
@@ -570,7 +578,6 @@ def api_meta():
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
-
     filtered = _apply_type_filter(filtered, q_type, type_col)
 
     if q_dept and dept_col in filtered.columns:
@@ -625,7 +632,16 @@ def api_meta():
     item_names = []
     if q_type and q_dept and q_brand and not filtered.empty:
         disp = [_display_name_fallback(r, lang) for _, r in filtered.iterrows()]
-        item_names = sorted(pd.Series(disp).dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())[:MAX_ITEM_NAMES]
+        item_names = sorted(
+            pd.Series(disp)
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )[:MAX_ITEM_NAMES]
 
     return jsonify({
         "types": types,
@@ -651,7 +667,6 @@ def api_suggest():
     brand_col_lang, product_col_lang, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
-
     filtered = _apply_type_filter(filtered, q_type, type_col)
 
     if q_dept and dept_col in filtered.columns:
