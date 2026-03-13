@@ -18,11 +18,11 @@ app = Flask(__name__)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
 
-# Master dataset (original)
+# Master dataset
 DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
 DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
 
-# NEW: Department mapping dataset
+# Department mapping dataset
 DEPT_MAP_PATH = os.getenv("DEPT_MAP_PATH", "mapping.xlsx")
 
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
@@ -33,7 +33,10 @@ if not _frontend_origins:
 else:
     CORS(app, resources={r"/api/*": {"origins": _frontend_origins}})
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")])
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")]
+)
 limiter.init_app(app)
 
 # Cache holds the merged DataFrame (master + mapping)
@@ -57,28 +60,35 @@ def _normalize_origin(value: str) -> str:
         pass
     return ""
 
+
 def _origin_allowed() -> bool:
     if not ENFORCE_ORIGIN or not ALLOWED_ORIGINS:
         return True
+
     origin = request.headers.get("Origin", "")
     ref = request.headers.get("Referer", "")
+
     if origin:
         return _normalize_origin(origin) in ALLOWED_ORIGINS
     if ref:
         return _normalize_origin(ref) in ALLOWED_ORIGINS
     return False
 
+
 @app.before_request
 def _block_unknown_origins():
     if request.path == "/api/healthz":
         return
+
     if request.path == "/api/refresh":
         auth = request.headers.get("Authorization", "")
         if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
             return
+
     if request.path.startswith("/api/"):
         if not _origin_allowed():
             return jsonify({"error": "origin not allowed"}), 403
+
 
 @app.after_request
 def _security_headers(resp):
@@ -90,6 +100,7 @@ def _security_headers(resp):
     resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
 
+
 # ── Column helpers ───────────────────────────────────────────────────────────
 def _get_series(row, *names):
     for n in names:
@@ -97,16 +108,19 @@ def _get_series(row, *names):
             return row.get(n)
     return None
 
+
 def _get_col(df, *names):
     for n in names:
         if n in df.columns:
             return n
     return None
 
+
 # ── Data access ──────────────────────────────────────────────────────────────
 def _fetch_excel_bytes_from_github_path(path: str) -> bytes:
     if not GITHUB_TOKEN:
         raise RuntimeError("Server missing GITHUB_TOKEN")
+
     url = f"https://api.github.com/repos/{DATA_REPO}/contents/{path}"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -117,17 +131,41 @@ def _fetch_excel_bytes_from_github_path(path: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+
+def _clean_text_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
+
+
 def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
-    # Filter bundles if present
+    """
+    Apply updated preprocessing rules to the master dataset:
+      1. Keep only BUNDLE_TYPE = Consumable
+      2. Exclude rows where EXCLUSION = Y
+      3. Build Item_str as zero-padded 8-digit SKU
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
     if "BUNDLE_TYPE" in df.columns:
-        df = df[df["BUNDLE_TYPE"].isin(["Compatible", "Consumable"])].copy()
-    # String SKU padded to 8 digits
+        bundle_type = _clean_text_series(df["BUNDLE_TYPE"]).str.lower()
+        df = df[bundle_type == "consumable"].copy()
+
+    if "EXCLUSION" in df.columns:
+        exclusion = _clean_text_series(df["EXCLUSION"]).str.upper()
+        df = df[exclusion != "Y"].copy()
+
     item_col = _get_col(df, "ITEM", "Item")
     if item_col:
         df["Item_str"] = (
-            df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+            df[item_col]
+            .astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+            .str.zfill(8)
         )
+
     return df
+
 
 def _load_dept_mapping() -> pd.DataFrame:
     """
@@ -141,23 +179,27 @@ def _load_dept_mapping() -> pd.DataFrame:
         dfm = pd.DataFrame()
 
     dfm.columns = [str(c).strip() for c in dfm.columns]
-    for c in ["ITEM_DEPT_NAME","ITEM_DEPT_NAME_EN","ITEM_DEPT_NAME_TC","ITEM_DEPT_NAME_SC"]:
+
+    for c in ["ITEM_DEPT_NAME", "ITEM_DEPT_NAME_EN", "ITEM_DEPT_NAME_TC", "ITEM_DEPT_NAME_SC"]:
         if c not in dfm.columns:
             dfm[c] = ""
+
     dfm["ITEM_DEPT_NAME"] = dfm["ITEM_DEPT_NAME"].astype(str).str.strip()
     return dfm
+
 
 def load_df(force: bool = False) -> pd.DataFrame:
     now = time.time()
     if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
         return _CACHE["df"]
 
-    # Load master
     content = _fetch_excel_bytes_from_github_path(DATA_PATH)
+
     if DATA_SHEET:
         df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
     else:
         df = pd.read_excel(BytesIO(content), engine="openpyxl")
+
     df.columns = [str(c).strip() for c in df.columns]
     df = _post_load_normalize(df)
 
@@ -170,6 +212,7 @@ def load_df(force: bool = False) -> pd.DataFrame:
     _CACHE.update({"df": df, "ts": now})
     return df
 
+
 def extract_sku_from_url(url: str) -> str | None:
     for p in (r"variant=(\d{8})", r"/p/(\d{8})", r"/p/BP_(\d{8})"):
         m = re.search(p, url)
@@ -177,9 +220,19 @@ def extract_sku_from_url(url: str) -> str | None:
             return m.group(1)
     return None
 
+
 # ── Language helpers ─────────────────────────────────────────────────────────
-LANG_BRAND_MAP = {"en": "BRAND_NAME_EN", "tc": "BRAND_NAME_TC", "sc": "BRAND_NAME_SC"}
-LANG_PRODUCT_MAP = {"en": "PRODUCT_NAME_EN", "tc": "PRODUCT_NAME_TC", "sc": "PRODUCT_NAME_SC"}
+LANG_BRAND_MAP = {
+    "en": "BRAND_NAME_EN",
+    "tc": "BRAND_NAME_TC",
+    "sc": "BRAND_NAME_SC",
+}
+LANG_PRODUCT_MAP = {
+    "en": "PRODUCT_NAME_EN",
+    "tc": "PRODUCT_NAME_TC",
+    "sc": "PRODUCT_NAME_SC",
+}
+
 
 def _norm_lang(s: str | None) -> str:
     s = (s or "en").strip().lower().replace("_", "-")
@@ -191,8 +244,8 @@ def _norm_lang(s: str | None) -> str:
         return s
     return "en"
 
+
 def _safe_str(v) -> str:
-    """Return '' for NaN/None, else str(v)."""
     if v is None:
         return ""
     try:
@@ -202,36 +255,48 @@ def _safe_str(v) -> str:
         pass
     return str(v)
 
+
 def _cap_words_en(brand: str) -> str:
     if not brand:
         return brand
     if re.search(r"[^\x00-\x7F]", brand):
         return brand
-    return re.sub(r"[A-Za-z]+", lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), brand)
+    return re.sub(
+        r"[A-Za-z]+",
+        lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
+        brand
+    )
+
 
 def _display_name(brand, product, lang: str) -> str:
     b = _safe_str(brand).strip()
     p = _safe_str(product).strip()
+
     if not b and not p:
         return ""
+
     if lang == "en":
         b_disp = _cap_words_en(b)
         bl = b.lower()
         pl = p.lower()
-        if pl.startswith(bl + " "):
+
+        if bl and pl.startswith(bl + " "):
             return b_disp + p[len(b):]
         if pl == bl:
             return b_disp
         return f"{b_disp} {p}".strip()
-    if p.startswith(b + " "):
+
+    if b and p.startswith(b + " "):
         return b + p[len(b):]
     if p == b:
         return b
     return f"{b} {p}".strip()
 
+
 def _brand_for_display(brand, lang: str) -> str:
     b = _safe_str(brand)
     return _cap_words_en(b) if lang == "en" else b
+
 
 def _allow_to_buy_val(val) -> int:
     try:
@@ -239,15 +304,20 @@ def _allow_to_buy_val(val) -> int:
     except Exception:
         return 1 if str(val).strip() == "1" else 0
 
+
 def _dept_label(row_like, lang: str) -> str:
-    """
-    row_like: Series or DataFrame row with mapping columns
-    """
-    col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+    col = {
+        "en": "ITEM_DEPT_NAME_EN",
+        "tc": "ITEM_DEPT_NAME_TC",
+        "sc": "ITEM_DEPT_NAME_SC",
+    }[lang]
+
     lbl = _safe_str(row_like.get(col)) if hasattr(row_like, "get") else ""
     if lbl:
         return lbl
+
     return _safe_str(row_like.get("ITEM_DEPT_NAME")) if hasattr(row_like, "get") else ""
+
 
 # ── Column selection usable for DataFrame *or* Series ────────────────────────
 def _select_cols(df_like, lang: str):
@@ -258,7 +328,8 @@ def _select_cols(df_like, lang: str):
     else:
         cols = set()
 
-    def has(c): return c in cols
+    def has(c):
+        return c in cols
 
     brand_col = LANG_BRAND_MAP[lang] if has(LANG_BRAND_MAP[lang]) else None
     product_col = LANG_PRODUCT_MAP[lang] if has(LANG_PRODUCT_MAP[lang]) else None
@@ -268,21 +339,27 @@ def _select_cols(df_like, lang: str):
     bundle_col = "BUNDLE_ID" if has("BUNDLE_ID") else None
     allow_col = "ALLOW_TO_BUY" if has("ALLOW_TO_BUY") else ("Allow To Buy" if has("Allow To Buy") else None)
     rrp_col = "RRP" if has("RRP") else None
+
     return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
+
 
 # ── Builders ─────────────────────────────────────────────────────────────────
 def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
     brand_col, product_col, *_ = _select_cols(df, lang)
     if not (brand_col and product_col):
         return pd.DataFrame()
+
     tmp = df[[c for c in (brand_col, product_col) if c in df.columns]].copy()
     tmp["_disp"] = [
-        _display_name(b, p, lang) for b, p in zip(tmp.get(brand_col), tmp.get(product_col))
+        _display_name(b, p, lang)
+        for b, p in zip(tmp.get(brand_col), tmp.get(product_col))
     ]
     return df[tmp["_disp"] == name]
 
+
 def _row_to_result(row: pd.Series, lang: str) -> dict:
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
+
     brand_raw = _safe_str(_get_series(row, brand_col))
     product_raw = _safe_str(_get_series(row, product_col))
     dept_raw = _safe_str(_get_series(row, dept_col))
@@ -317,8 +394,10 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
         "allow_to_buy": allow,
     }
 
+
 def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+
     if not (bundle_col and type_col) or pd.isna(row.get(bundle_col)):
         return []
 
@@ -337,12 +416,17 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
 
     if "Item_str" not in rel.columns and item_col in rel.columns:
         rel["Item_str"] = (
-            rel[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+            rel[item_col]
+            .astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+            .str.zfill(8)
         )
 
     out = []
     for _, r in rel.iterrows():
         allow = _allow_to_buy_val(r.get(allow_col) if allow_col else None)
+
         rrp_val = None
         if "RRP" in r and pd.notna(r["RRP"]):
             try:
@@ -359,12 +443,15 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
             "Item": _safe_str(r.get("Item_str", "")),
             "Allow To Buy": 1 if allow else 0,
         })
+
     return out
+
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/api/healthz")
 def health():
     return {"ok": True}
+
 
 @limiter.limit(os.getenv("RATE_LIMIT_META", "30/minute;1000/day"))
 @app.get("/api/meta")
@@ -378,6 +465,7 @@ def api_meta():
     brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
+
     if q_type and type_col in filtered.columns:
         filtered = filtered[filtered[type_col] == q_type]
     if q_dept and dept_col in filtered.columns:
@@ -390,11 +478,17 @@ def api_meta():
     departments = []
     if dept_col in filtered.columns:
         dept_raws = sorted(filtered[dept_col].dropna().astype(str).unique().tolist())
-        label_col = {"en": "ITEM_DEPT_NAME_EN", "tc": "ITEM_DEPT_NAME_TC", "sc": "ITEM_DEPT_NAME_SC"}[lang]
+        label_col = {
+            "en": "ITEM_DEPT_NAME_EN",
+            "tc": "ITEM_DEPT_NAME_TC",
+            "sc": "ITEM_DEPT_NAME_SC",
+        }[lang]
+
         lab_map = {}
         if label_col in df.columns and dept_col in df.columns:
             pairs = df[[dept_col, label_col]].dropna().astype({dept_col: str})
             lab_map = dict(zip(pairs[dept_col], pairs[label_col].fillna("").astype(str)))
+
         for raw in dept_raws:
             label = lab_map.get(raw) or raw
             departments.append({"value": raw, "label": label})
@@ -409,7 +503,13 @@ def api_meta():
         ]
         item_names = sorted(pd.Series(disp).dropna().astype(str).unique().tolist())[:MAX_ITEM_NAMES]
 
-    return jsonify({"types": types, "departments": departments, "brands": brands, "item_names": item_names})
+    return jsonify({
+        "types": types,
+        "departments": departments,
+        "brands": brands,
+        "item_names": item_names,
+    })
+
 
 @app.get("/api/suggest")
 def api_suggest():
@@ -424,16 +524,16 @@ def api_suggest():
     q_dept = (request.args.get("department") or "").strip()
     q_brand = (request.args.get("brand") or "").strip()
 
-    # Filter by type/department first (same as current behavior)
     brand_col_lang, product_col_lang, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
 
     filtered = df.copy()
+
     if q_type and type_col in filtered.columns:
         filtered = filtered[filtered[type_col] == q_type]
     if q_dept and dept_col in filtered.columns:
         filtered = filtered[filtered[dept_col] == q_dept]
 
-    # Brand filter (best-effort across all languages so filters still work even if caller passes other language)
+    # Brand filter across all languages
     if q_brand:
         masks = []
         for l in ("en", "tc", "sc"):
@@ -441,12 +541,11 @@ def api_suggest():
             if bcol and bcol in filtered.columns:
                 ser = filtered[bcol].fillna("").astype(str).str.strip()
                 masks.append(ser == q_brand)
+
         if masks:
             any_mask = pd.concat(masks, axis=1).any(axis=1)
             filtered = filtered[any_mask]
 
-    # Build display names for all 3 languages so query can match in *any* language,
-    # while we still return suggestions in the requested output language (lang).
     disp = {}
     have = {}
     n = len(filtered)
@@ -454,6 +553,7 @@ def api_suggest():
     for l in ("en", "tc", "sc"):
         bcol, pcol, *_ = _select_cols(filtered, l)
         have[l] = bool(bcol and pcol and bcol in filtered.columns and pcol in filtered.columns)
+
         if have[l]:
             disp[l] = [
                 _display_name(b, p, l)
@@ -462,11 +562,9 @@ def api_suggest():
         else:
             disp[l] = [""] * n
 
-    # If we don't have the output language columns, we can't return localized suggestions reliably.
     if not have.get(lang, False):
         return jsonify({"suggestions": []})
 
-    # Broad match helpers
     def _tokenize(s: str) -> list[str]:
         return [
             t
@@ -487,43 +585,37 @@ def api_suggest():
         cand = (candidate or "").strip()
         if not cand:
             return False
+
         cand_l = cand.lower()
         cand_tokens = _tokenize(cand_l)
         cand_compact = _compact(cand_l)
 
         for qt in q_tokens:
-            # Direct substring
             if qt in cand_l:
                 continue
 
-            # Compacted substring (handles "toothbrush" vs "tooth brush")
             qt_compact = _compact(qt)
             if qt_compact and qt_compact in cand_compact:
                 continue
 
-            # Token-wise partials
             if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
                 continue
 
-            # Whole-query compact (handles multi-token typed queries)
             if q_compact and q_compact in cand_compact:
                 continue
 
             return False
+
         return True
 
     suggestions = []
     seen = set()
 
-    # Match query against any-language names, but return the suggestion in the requested language.
     for dl, de, dtc, dsc in zip(disp[lang], disp["en"], disp["tc"], disp["sc"]):
         out = (dl or "").strip()
-
-        # Always return suggestions in the requested output language to keep dropdown search stable.
         if not out:
             continue
 
-        # Match surface: any of the language strings (whichever exist)
         if not (_broad_match(de) or _broad_match(dtc) or _broad_match(dsc) or _broad_match(dl)):
             continue
 
@@ -533,6 +625,7 @@ def api_suggest():
 
     suggestions = sorted(suggestions)[:MAX_SUGGESTIONS]
     return jsonify({"suggestions": suggestions})
+
 
 @limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
@@ -572,11 +665,13 @@ def api_search():
     elif action == "number":
         if NUMBER_SEARCH_DELAY_MS > 0:
             time.sleep(NUMBER_SEARCH_DELAY_MS / 1000.0)
+
         num = (payload.get("product_number") or "").strip()
         if not num.isdigit() or len(num) != 8:
             error = "Please enter an 8-digit product number."
         else:
             product_number = num
+
     else:
         error = "Invalid action."
 
@@ -587,8 +682,13 @@ def api_search():
         item_col = _get_col(df, "ITEM", "Item")
         if item_col:
             df["Item_str"] = (
-                df[item_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
+                df[item_col]
+                .astype(str)
+                .str.replace(r"\.0$", "", regex=True)
+                .str.strip()
+                .str.zfill(8)
             )
+
     match = df[df["Item_str"] == product_number]
     if match.empty:
         return jsonify({"error": f"Product {product_number} not found."}), 404
@@ -596,10 +696,13 @@ def api_search():
     row = match.iloc[0]
     result = _row_to_result(row, lang)
     related = _related_items(df, row, lang)
+
     resp = {"result": result, "related_items": related}
     if action == "dropdown":
         resp["scroll_hint"] = {"mode": "scrollBy", "px": SCROLL_OFFSET_PX}
+
     return jsonify(resp)
+
 
 @limiter.limit(os.getenv("RATE_LIMIT_REFRESH", "5/hour;20/day"))
 @app.post("/api/refresh")
@@ -607,12 +710,15 @@ def api_refresh():
     auth = request.headers.get("Authorization", "")
     if not API_REFRESH_TOKEN or auth != f"Bearer {API_REFRESH_TOKEN}":
         return jsonify({"error": "unauthorized"}), 401
+
     load_df(force=True)
     return jsonify({"ok": True, "message": "Data cache refreshed."})
+
 
 @app.errorhandler(429)
 def _ratelimit_handler(e):
     return jsonify({"error": "Too many requests. Please try again later."}), 429
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
