@@ -886,9 +886,9 @@ def api_search():
 
     try:
         df = load_df()
-    except Exception:
+    except Exception as e:
         logger.exception("api_search failed")
-        return jsonify({"error": "dataset unavailable"}), 500
+        return jsonify({"error": "dataset unavailable", "details": str(e)}), 500
 
     product_number = None
     error = None
