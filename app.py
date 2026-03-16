@@ -1,125 +1,38 @@
 import os
 import re
 import time
+import logging
+import threading
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 
-# ── Config / Env ─────────────────────────────────────────────────────────────
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data")
-
-# Master dataset
-DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx")
-DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
-
-# Department mapping dataset
-DEPT_MAP_PATH = os.getenv("DEPT_MAP_PATH", "mapping.xlsx")
-
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
-
-_frontend_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
-if not _frontend_origins:
-    CORS(app)
-else:
-    CORS(app, resources={r"/api/*": {"origins": _frontend_origins}})
-
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")]
-)
-limiter.init_app(app)
-
-# Cache holds the merged DataFrame (master + mapping)
-_CACHE = {"df": None, "ts": 0}
-
-ENFORCE_ORIGIN = os.getenv("ENFORCE_ORIGIN", "true").lower() == "true"
-ALLOWED_ORIGINS = {o.lower() for o in _frontend_origins}
-API_REFRESH_TOKEN = os.getenv("API_REFRESH_TOKEN", "")
-MAX_ITEM_NAMES = int(os.getenv("MAX_ITEM_NAMES", "200"))
-MAX_SUGGESTIONS = int(os.getenv("MAX_SUGGESTIONS", "20"))
-NUMBER_SEARCH_DELAY_MS = int(os.getenv("NUMBER_SEARCH_DELAY_MS", "250"))
-SCROLL_OFFSET_PX = int(os.getenv("SCROLL_OFFSET_PX", "160"))
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("core-accessory-tool")
 
 ALL_LANGS = ("en", "tc", "sc")
 
-# ── Security / Origins ───────────────────────────────────────────────────────
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def _normalize_origin(value: str) -> str:
     try:
-        p = urlparse(value)
+        p = urlparse((value or "").strip())
         if p.scheme and p.netloc:
             return f"{p.scheme.lower()}://{p.netloc.lower()}"
     except Exception:
         pass
     return ""
-
-
-def _origin_allowed() -> bool:
-    if not ENFORCE_ORIGIN or not ALLOWED_ORIGINS:
-        return True
-
-    origin = request.headers.get("Origin", "")
-    ref = request.headers.get("Referer", "")
-
-    if origin:
-        return _normalize_origin(origin) in ALLOWED_ORIGINS
-
-    if ref:
-        return _normalize_origin(ref) in ALLOWED_ORIGINS
-
-    # Important for mobile app / Android WebView:
-    # some environments do not send Origin or Referer.
-    return True
-
-
-@app.before_request
-def _block_unknown_origins():
-    if request.path == "/api/healthz":
-        return
-
-    if request.path == "/api/refresh":
-        auth = request.headers.get("Authorization", "")
-        if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
-            return
-
-    if request.path.startswith("/api/"):
-        if not _origin_allowed():
-            return jsonify({"error": "origin not allowed"}), 403
-
-
-@app.after_request
-def _security_headers(resp):
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
-    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return resp
-
-
-# ── Column helpers ───────────────────────────────────────────────────────────
-def _get_series(row, *names):
-    for n in names:
-        if n and n in row:
-            return row.get(n)
-    return None
-
-
-def _get_col(df, *names):
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
 
 
 def _safe_str(v) -> str:
@@ -133,47 +46,173 @@ def _safe_str(v) -> str:
     return str(v)
 
 
+def _clean_text_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
+
+
 def _normalize_display_text(s: str) -> str:
     return re.sub(r"\s+", " ", _safe_str(s)).strip().casefold()
 
 
-# ── Data access ──────────────────────────────────────────────────────────────
+def _get_col(df, *names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _get_series(row, *names):
+    for n in names:
+        if n and n in row:
+            return row.get(n)
+    return None
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data").strip()
+
+DATA_PATH = os.getenv("DATA_PATH", "Accessory-Core-Master.xlsx").strip()
+DATA_SHEET = os.getenv("DATA_SHEET", "").strip() or None
+DEPT_MAP_PATH = os.getenv("DEPT_MAP_PATH", "mapping.xlsx").strip()
+
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
+API_REFRESH_TOKEN = os.getenv("API_REFRESH_TOKEN", "").strip()
+ENFORCE_ORIGIN = os.getenv("ENFORCE_ORIGIN", "true").lower() == "true"
+
+MAX_ITEM_NAMES = int(os.getenv("MAX_ITEM_NAMES", "200"))
+MAX_SUGGESTIONS = int(os.getenv("MAX_SUGGESTIONS", "20"))
+NUMBER_SEARCH_DELAY_MS = int(os.getenv("NUMBER_SEARCH_DELAY_MS", "250"))
+SCROLL_OFFSET_PX = int(os.getenv("SCROLL_OFFSET_PX", "160"))
+
+_raw_frontend_origins = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()
+]
+FRONTEND_ORIGINS = [o for o in (_normalize_origin(x) for x in _raw_frontend_origins) if o]
+ALLOWED_ORIGINS = set(FRONTEND_ORIGINS)
+
+if FRONTEND_ORIGINS:
+    CORS(app, resources={r"/api/*": {"origins": FRONTEND_ORIGINS}})
+else:
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "200 per hour")],
+)
+limiter.init_app(app)
+
+_CACHE = {"df": None, "ts": 0}
+_CACHE_LOCK = threading.Lock()
+
+
+# ── HTTP session ─────────────────────────────────────────────────────────────
+_HTTP = requests.Session()
+_retry = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+)
+_adapter = HTTPAdapter(max_retries=_retry)
+_HTTP.mount("https://", _adapter)
+_HTTP.mount("http://", _adapter)
+
+
+# ── Security ─────────────────────────────────────────────────────────────────
+def _origin_allowed() -> bool:
+    if not ENFORCE_ORIGIN or not ALLOWED_ORIGINS:
+        return True
+
+    origin = request.headers.get("Origin", "")
+    ref = request.headers.get("Referer", "")
+
+    if origin:
+        return _normalize_origin(origin) in ALLOWED_ORIGINS
+
+    if ref:
+        return _normalize_origin(ref) in ALLOWED_ORIGINS
+
+    # Allow clients that do not send Origin / Referer
+    return True
+
+
+@app.before_request
+def _block_unknown_origins():
+    if request.path == "/api/healthz":
+        return
+
+    if request.path == "/api/refresh":
+        auth = request.headers.get("Authorization", "")
+        if API_REFRESH_TOKEN and auth == f"Bearer {API_REFRESH_TOKEN}":
+            return
+
+    if request.path.startswith("/api/") and not _origin_allowed():
+        return jsonify({"error": "origin not allowed"}), 403
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
+
+
+# ── Data loading ─────────────────────────────────────────────────────────────
+def _ensure_minimum_columns(df: pd.DataFrame):
+    required = {
+        "BUNDLE_TYPE",
+        "BUNDLE_ID",
+        "ITEM",
+        "EXCLUSION",
+        "ITEM_DEPT_NAME",
+        "BRAND_NAME_EN",
+        "BRAND_NAME_TC",
+        "BRAND_NAME_SC",
+        "PRODUCT_NAME_EN",
+        "PRODUCT_NAME_TC",
+        "PRODUCT_NAME_SC",
+        "RRP",
+        "ALLOW_TO_BUY",
+    }
+    missing = sorted(c for c in required if c not in df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
+
+
 def _fetch_excel_bytes_from_github_path(path: str) -> bytes:
     if not GITHUB_TOKEN:
         raise RuntimeError("Server missing GITHUB_TOKEN")
 
     url = f"https://api.github.com/repos/{DATA_REPO}/contents/{path}"
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3.raw",
         "User-Agent": "core-accessory-tool",
     }
-    r = requests.get(url, headers=headers, timeout=30)
+
+    r = _HTTP.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
 
 
-def _clean_text_series(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).str.strip()
-
-
 def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply preprocessing rules:
-      1. Keep only BUNDLE_TYPE = Consumable
-      2. Exclude rows where EXCLUSION = Y
-      3. Build Item_str as zero-padded 8-digit SKU
-    """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    _ensure_minimum_columns(df)
 
-    if "BUNDLE_TYPE" in df.columns:
-        bundle_type = _clean_text_series(df["BUNDLE_TYPE"]).str.lower()
-        df = df[bundle_type == "consumable"].copy()
+    # Required filtering rules
+    bundle_type = _clean_text_series(df["BUNDLE_TYPE"]).str.lower()
+    df = df[bundle_type == "consumable"].copy()
 
-    if "EXCLUSION" in df.columns:
-        exclusion = _clean_text_series(df["EXCLUSION"]).str.upper()
-        df = df[exclusion != "Y"].copy()
+    exclusion = _clean_text_series(df["EXCLUSION"]).str.upper()
+    df = df[exclusion != "Y"].copy()
 
     item_col = _get_col(df, "ITEM", "Item")
     if item_col:
@@ -181,22 +220,30 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
             df[item_col]
             .astype(str)
             .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"\D", "", regex=True)
             .str.strip()
             .str.zfill(8)
         )
+
+    trim_cols = [
+        "SHEET_NAME",
+        "ITEM_DEPT_NAME",
+        "BRAND_NAME_EN", "BRAND_NAME_TC", "BRAND_NAME_SC",
+        "PRODUCT_NAME_EN", "PRODUCT_NAME_TC", "PRODUCT_NAME_SC",
+    ]
+    for c in trim_cols:
+        if c in df.columns:
+            df[c] = df[c].fillna("").astype(str).str.strip()
 
     return df
 
 
 def _load_dept_mapping() -> pd.DataFrame:
-    """
-    Returns columns:
-      ITEM_DEPT_NAME, ITEM_DEPT_NAME_EN, ITEM_DEPT_NAME_TC, ITEM_DEPT_NAME_SC
-    """
     try:
         content = _fetch_excel_bytes_from_github_path(DEPT_MAP_PATH)
         dfm = pd.read_excel(BytesIO(content), engine="openpyxl")
     except Exception:
+        logger.exception("Unable to load department mapping: %s", DEPT_MAP_PATH)
         dfm = pd.DataFrame()
 
     dfm.columns = [str(c).strip() for c in dfm.columns]
@@ -205,39 +252,72 @@ def _load_dept_mapping() -> pd.DataFrame:
         if c not in dfm.columns:
             dfm[c] = ""
 
-    dfm["ITEM_DEPT_NAME"] = dfm["ITEM_DEPT_NAME"].astype(str).str.strip()
+    if not dfm.empty:
+        dfm["ITEM_DEPT_NAME"] = dfm["ITEM_DEPT_NAME"].astype(str).str.strip()
+        dfm = dfm.drop_duplicates(subset=["ITEM_DEPT_NAME"], keep="first")
+
     return dfm
 
 
 def load_df(force: bool = False) -> pd.DataFrame:
     now = time.time()
-    if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
-        return _CACHE["df"]
 
-    content = _fetch_excel_bytes_from_github_path(DATA_PATH)
+    with _CACHE_LOCK:
+        if _CACHE["df"] is not None and not force and (now - _CACHE["ts"] < CACHE_TTL):
+            return _CACHE["df"]
 
-    if DATA_SHEET:
-        df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
-    else:
-        df = pd.read_excel(BytesIO(content), engine="openpyxl")
+        content = _fetch_excel_bytes_from_github_path(DATA_PATH)
 
-    df.columns = [str(c).strip() for c in df.columns]
-    df = _post_load_normalize(df)
+        if DATA_SHEET:
+            df = pd.read_excel(BytesIO(content), engine="openpyxl", sheet_name=DATA_SHEET)
+        else:
+            df = pd.read_excel(BytesIO(content), engine="openpyxl")
 
-    df_map = _load_dept_mapping()
-    if "ITEM_DEPT_NAME" in df.columns and not df_map.empty:
-        df["ITEM_DEPT_NAME"] = df["ITEM_DEPT_NAME"].astype(str).str.strip()
-        df = df.merge(df_map, on="ITEM_DEPT_NAME", how="left")
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Loaded workbook is not a single-sheet DataFrame. Please set DATA_SHEET correctly.")
 
-    _CACHE.update({"df": df, "ts": now})
-    return df
+        df.columns = [str(c).strip() for c in df.columns]
+        df = _post_load_normalize(df)
+
+        df_map = _load_dept_mapping()
+        if "ITEM_DEPT_NAME" in df.columns and not df_map.empty:
+            df["ITEM_DEPT_NAME"] = df["ITEM_DEPT_NAME"].astype(str).str.strip()
+            df = df.merge(df_map, on="ITEM_DEPT_NAME", how="left")
+
+        _CACHE.update({"df": df, "ts": now})
+        logger.info("Dataset loaded: %s rows after filtering", len(df))
+        return df
 
 
 def extract_sku_from_url(url: str) -> str | None:
-    for p in (r"variant=(\d{8})", r"/p/(\d{8})", r"/p/BP_(\d{8})"):
-        m = re.search(p, url)
+    value = (url or "").strip()
+    if not value:
+        return None
+
+    try:
+        parsed = urlparse(value)
+        qs = parse_qs(parsed.query)
+
+        for key in ("variant", "sku", "item", "product", "productId"):
+            for raw in qs.get(key, []):
+                m = re.search(r"(\d{8})", raw)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+
+    patterns = (
+        r"/p/BP_(\d{8})(?:[/?#]|$)",
+        r"/p/(\d{8})(?:[/?#]|$)",
+        r"(?:sku|item|variant|productId|product)[=/](\d{8})(?:[&#/?]|$)",
+        r"(?<!\d)(\d{8})(?!\d)",
+    )
+
+    for p in patterns:
+        m = re.search(p, value, flags=re.IGNORECASE)
         if m:
             return m.group(1)
+
     return None
 
 
@@ -273,7 +353,7 @@ def _cap_words_en(brand: str) -> str:
     return re.sub(
         r"[A-Za-z]+",
         lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
-        brand
+        brand,
     )
 
 
@@ -355,10 +435,19 @@ def _dept_label(row_like, lang: str) -> str:
 
 def _normalize_type_value(v: str) -> str:
     x = (v or "").strip().upper()
+
+    # Standard type values
     if x in ("A", "ACCESSORY"):
         return "A"
     if x in ("C", "CORE", "CORE ITEM"):
         return "C"
+
+    # Fallback if only SHEET_NAME exists
+    if "ACCESS" in x:
+        return "A"
+    if "CORE" in x:
+        return "C"
+
     return x
 
 
@@ -367,13 +456,10 @@ def _apply_type_filter(df: pd.DataFrame, q_type: str, type_col: str | None) -> p
         return df
 
     q_norm = _normalize_type_value(q_type)
-    ser = _clean_text_series(df[type_col]).str.upper()
+    ser = _clean_text_series(df[type_col]).str.upper().map(_normalize_type_value)
 
-    if q_norm == "A":
-        return df[ser.isin(["A", "ACCESSORY"])]
-
-    if q_norm == "C":
-        return df[ser.isin(["C", "CORE ITEM", "CORE"])]
+    if q_norm in ("A", "C"):
+        return df[ser == q_norm]
 
     return df[ser == q_norm]
 
@@ -422,13 +508,13 @@ def _collect_search_values(row_like) -> list[str]:
     seen = set()
     out = []
     for v in vals:
-        if v and v not in seen:
-            seen.add(v)
+        key = _normalize_display_text(v)
+        if v and key not in seen:
+            seen.add(key)
             out.append(v)
     return out
 
 
-# ── Column selection usable for DataFrame *or* Series ────────────────────────
 def _select_cols(df_like, lang: str):
     if hasattr(df_like, "columns"):
         cols = set(map(str, df_like.columns))
@@ -444,7 +530,13 @@ def _select_cols(df_like, lang: str):
     product_col = LANG_PRODUCT_MAP[lang] if has(LANG_PRODUCT_MAP[lang]) else None
     item_col = "ITEM" if has("ITEM") else ("Item" if has("Item") else None)
     dept_col = "ITEM_DEPT_NAME" if has("ITEM_DEPT_NAME") else None
-    type_col = "ITEM_TYPE" if has("ITEM_TYPE") else None
+
+    # ITEM_TYPE is preferred. If missing, use SHEET_NAME as a fallback.
+    type_col = (
+        "ITEM_TYPE" if has("ITEM_TYPE")
+        else ("SHEET_NAME" if has("SHEET_NAME") else None)
+    )
+
     bundle_col = "BUNDLE_ID" if has("BUNDLE_ID") else None
     allow_col = "ALLOW_TO_BUY" if has("ALLOW_TO_BUY") else ("Allow To Buy" if has("Allow To Buy") else None)
     rrp_col = "RRP" if has("RRP") else None
@@ -452,7 +544,7 @@ def _select_cols(df_like, lang: str):
     return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
 
 
-# ── Builders ─────────────────────────────────────────────────────────────────
+# ── Matching / building ──────────────────────────────────────────────────────
 def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -467,14 +559,19 @@ def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFra
 
 
 def _row_to_result(row: pd.Series, lang: str) -> dict:
-    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(row, lang)
+    _, _, _, dept_col, type_col, _, allow_col, _ = _select_cols(row, lang)
 
     dept_raw = _safe_str(_get_series(row, dept_col))
     dept_disp = _dept_label(row, lang)
 
-    item_type = _safe_str(_get_series(row, type_col)).strip()
-    item_type_norm = _normalize_type_value(item_type)
-    type_label = "Accessory" if item_type_norm == "A" else "Core Item"
+    item_type_raw = _safe_str(_get_series(row, type_col)).strip()
+    item_type_norm = _normalize_type_value(item_type_raw)
+
+    type_label = ""
+    if item_type_norm == "A":
+        type_label = "Accessory"
+    elif item_type_norm == "C":
+        type_label = "Core Item"
 
     item = _safe_str(_get_series(row, "Item_str"))
     allow = _allow_to_buy_val(_get_series(row, allow_col) if allow_col else None)
@@ -497,7 +594,7 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
         "brand": brand_disp,
         "department": dept_disp,
         "department_raw": dept_raw,
-        "item_type": item_type,
+        "item_type": item_type_raw,
         "type_label": type_label,
         "rrp": rrp,
         "allow_to_buy": allow,
@@ -505,23 +602,31 @@ def _row_to_result(row: pd.Series, lang: str) -> dict:
 
 
 def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
-    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    _, _, item_col, _, type_col, bundle_col, allow_col, _ = _select_cols(df, lang)
 
-    if not (bundle_col and type_col) or pd.isna(row.get(bundle_col)):
+    if not bundle_col or pd.isna(row.get(bundle_col)):
         return []
 
-    row_type_norm = _normalize_type_value(_safe_str(row.get(type_col)))
-    opposite_type = "C" if row_type_norm == "A" else "A"
+    row_item = _safe_str(row.get("Item_str")).strip()
+    row_bundle = row.get(bundle_col)
 
-    rel_type_ser = _clean_text_series(df[type_col]).str.upper()
-    if opposite_type == "A":
-        rel = df[(df[bundle_col] == row.get(bundle_col)) & (rel_type_ser.isin(["A", "ACCESSORY"]))].copy()
-    else:
-        rel = df[(df[bundle_col] == row.get(bundle_col)) & (rel_type_ser.isin(["C", "CORE ITEM", "CORE"]))].copy()
+    # If type exists, return opposite-side items in same bundle.
+    # If type does not exist, return all other items in same bundle.
+    rel = df[df[bundle_col] == row_bundle].copy()
+
+    if type_col and type_col in df.columns:
+        row_type_norm = _normalize_type_value(_safe_str(row.get(type_col)))
+        if row_type_norm == "A":
+            rel = rel[_clean_text_series(rel[type_col]).str.upper().map(_normalize_type_value) == "C"].copy()
+        elif row_type_norm == "C":
+            rel = rel[_clean_text_series(rel[type_col]).str.upper().map(_normalize_type_value) == "A"].copy()
+
+    if row_item:
+        rel = rel[rel["Item_str"].astype(str).str.strip() != row_item].copy()
 
     rel["_disp"] = [_display_name_fallback(r, lang) for _, r in rel.iterrows()]
     rel = rel[rel["_disp"].astype(str).str.strip() != ""]
-    rel = rel.drop_duplicates(subset=["_disp"])
+    rel = rel.drop_duplicates(subset=["Item_str"], keep="first")
 
     sort_cols = [c for c in ["RRP", "_disp"] if c in rel.columns]
     if sort_cols:
@@ -532,6 +637,7 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
             rel[item_col]
             .astype(str)
             .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"\D", "", regex=True)
             .str.strip()
             .str.zfill(8)
         )
@@ -560,22 +666,82 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
     return out
 
 
+def _tokenize_search_text(s: str) -> list[str]:
+    return [
+        t
+        for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower())
+        if t
+    ]
+
+
+def _compact_search_text(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", "", (s or "").lower())
+
+
+def _broad_match(query: str, candidate: str) -> bool:
+    q = (query or "").strip()
+    cand = (candidate or "").strip()
+
+    if not q or not cand:
+        return False
+
+    q_tokens = _tokenize_search_text(q)
+    q_compact = _compact_search_text(q)
+
+    cand_l = cand.lower()
+    cand_tokens = _tokenize_search_text(cand_l)
+    cand_compact = _compact_search_text(cand_l)
+
+    if not q_tokens:
+        return False
+
+    if q_compact and q_compact in cand_compact:
+        return True
+
+    for qt in q_tokens:
+        if qt in cand_l:
+            continue
+
+        qt_compact = _compact_search_text(qt)
+        if qt_compact and qt_compact in cand_compact:
+            continue
+
+        if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
+            continue
+
+        return False
+
+    return True
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/api/healthz")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "repo": DATA_REPO,
+        "data_path": DATA_PATH,
+        "sheet": DATA_SHEET or "",
+        "cache_ttl_seconds": CACHE_TTL,
+        "allowed_origins": FRONTEND_ORIGINS,
+    }
 
 
 @limiter.limit(os.getenv("RATE_LIMIT_META", "30/minute;1000/day"))
 @app.get("/api/meta")
 def api_meta():
-    df = load_df()
+    try:
+        df = load_df()
+    except Exception:
+        logger.exception("api_meta failed")
+        return jsonify({"error": "dataset unavailable"}), 500
+
     lang = _norm_lang(request.args.get("lang"))
     q_type = (request.args.get("type") or "").strip()
     q_dept = (request.args.get("department") or "").strip()
     q_brand = (request.args.get("brand") or "").strip()
 
-    brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    _, _, _, dept_col, type_col, _, _, _ = _select_cols(df, lang)
 
     filtered = df.copy()
     filtered = _apply_type_filter(filtered, q_type, type_col)
@@ -587,12 +753,12 @@ def api_meta():
         filtered = filtered[_brand_mask(filtered, q_brand)]
 
     types = []
-    if type_col in df.columns:
+    if type_col and type_col in df.columns:
         type_vals = _clean_text_series(df[type_col]).str.upper()
         normalized_types = []
         for v in type_vals.unique().tolist():
             nv = _normalize_type_value(v)
-            if nv and nv not in normalized_types:
+            if nv in ("A", "C") and nv not in normalized_types:
                 normalized_types.append(nv)
         types = sorted(normalized_types)
 
@@ -651,20 +817,25 @@ def api_meta():
     })
 
 
+@limiter.limit(os.getenv("RATE_LIMIT_SUGGEST", "60/minute;5000/day"))
 @app.get("/api/suggest")
 def api_suggest():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"suggestions": []})
 
-    df = load_df()
-    lang = _norm_lang(request.args.get("lang"))
+    try:
+        df = load_df()
+    except Exception:
+        logger.exception("api_suggest failed")
+        return jsonify({"error": "dataset unavailable"}), 500
 
+    lang = _norm_lang(request.args.get("lang"))
     q_type = (request.args.get("type") or "").strip()
     q_dept = (request.args.get("department") or "").strip()
     q_brand = (request.args.get("brand") or "").strip()
 
-    brand_col_lang, product_col_lang, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col = _select_cols(df, lang)
+    _, _, _, dept_col, type_col, _, _, _ = _select_cols(df, lang)
 
     filtered = df.copy()
     filtered = _apply_type_filter(filtered, q_type, type_col)
@@ -678,60 +849,28 @@ def api_suggest():
     if filtered.empty:
         return jsonify({"suggestions": []})
 
-    def _tokenize(s: str) -> list[str]:
-        return [
-            t
-            for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower())
-            if t
-        ]
-
-    def _compact(s: str) -> str:
-        return re.sub(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", "", (s or "").lower())
-
-    q_tokens = _tokenize(q)
-    if not q_tokens:
-        return jsonify({"suggestions": []})
-
-    q_compact = _compact(q)
-
-    def _broad_match(candidate: str) -> bool:
-        cand = (candidate or "").strip()
-        if not cand:
-            return False
-
-        cand_l = cand.lower()
-        cand_tokens = _tokenize(cand_l)
-        cand_compact = _compact(cand_l)
-
-        for qt in q_tokens:
-            if qt in cand_l:
-                continue
-
-            qt_compact = _compact(qt)
-            if qt_compact and qt_compact in cand_compact:
-                continue
-
-            if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
-                continue
-
-            if q_compact and q_compact in cand_compact:
-                continue
-
-            return False
-
-        return True
-
     suggestions = []
     seen = set()
+    q_digits = re.sub(r"\D", "", q)
 
     for _, row in filtered.iterrows():
         out = _display_name_fallback(row, lang).strip()
-        if not out or out in seen:
+        if not out:
+            continue
+
+        out_key = _normalize_display_text(out)
+        if out_key in seen:
             continue
 
         search_values = _collect_search_values(row)
-        if any(_broad_match(v) for v in search_values):
-            seen.add(out)
+        matched = any(_broad_match(q, v) for v in search_values)
+
+        if not matched and q_digits:
+            item_str = _safe_str(row.get("Item_str")).strip()
+            matched = bool(item_str and q_digits in item_str)
+
+        if matched:
+            seen.add(out_key)
             suggestions.append(out)
 
     suggestions = sorted(suggestions)[:MAX_SUGGESTIONS]
@@ -741,11 +880,16 @@ def api_suggest():
 @limiter.limit(os.getenv("RATE_LIMIT_SEARCH", "20/minute;500/day"))
 @app.post("/api/search")
 def api_search():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request.get_json(silent=True) or {}
     action = (payload.get("action") or "").strip()
     lang = _norm_lang(payload.get("lang"))
 
-    df = load_df()
+    try:
+        df = load_df()
+    except Exception:
+        logger.exception("api_search failed")
+        return jsonify({"error": "dataset unavailable"}), 500
+
     product_number = None
     error = None
 
@@ -758,9 +902,7 @@ def api_search():
             if match.empty:
                 error = "No match found for the selected product."
             else:
-                item_col = _get_col(match, "ITEM", "Item")
-                sku_raw = str(match.iloc[0].get(item_col, "")).replace(".0", "") if item_col else ""
-                product_number = sku_raw.zfill(8)
+                product_number = _safe_str(match.iloc[0].get("Item_str")).strip()
 
     elif action == "link":
         link = (payload.get("product_link") or "").strip()
@@ -777,8 +919,8 @@ def api_search():
         if NUMBER_SEARCH_DELAY_MS > 0:
             time.sleep(NUMBER_SEARCH_DELAY_MS / 1000.0)
 
-        num = (payload.get("product_number") or "").strip()
-        if not num.isdigit() or len(num) != 8:
+        num = re.sub(r"\D", "", (payload.get("product_number") or "").strip())
+        if len(num) != 8:
             error = "Please enter an 8-digit product number."
         else:
             product_number = num
@@ -788,17 +930,6 @@ def api_search():
 
     if error:
         return jsonify({"error": error}), 400
-
-    if "Item_str" not in df.columns:
-        item_col = _get_col(df, "ITEM", "Item")
-        if item_col:
-            df["Item_str"] = (
-                df[item_col]
-                .astype(str)
-                .str.replace(r"\.0$", "", regex=True)
-                .str.strip()
-                .str.zfill(8)
-            )
 
     match = df[df["Item_str"] == product_number]
     if match.empty:
@@ -822,13 +953,24 @@ def api_refresh():
     if not API_REFRESH_TOKEN or auth != f"Bearer {API_REFRESH_TOKEN}":
         return jsonify({"error": "unauthorized"}), 401
 
-    load_df(force=True)
+    try:
+        load_df(force=True)
+    except Exception:
+        logger.exception("refresh failed")
+        return jsonify({"error": "refresh failed"}), 500
+
     return jsonify({"ok": True, "message": "Data cache refreshed."})
 
 
 @app.errorhandler(429)
 def _ratelimit_handler(e):
     return jsonify({"error": "Too many requests. Please try again later."}), 429
+
+
+@app.errorhandler(Exception)
+def _unhandled(e):
+    logger.exception("Unhandled error: %s", e)
+    return jsonify({"error": "internal server error"}), 500
 
 
 if __name__ == "__main__":
