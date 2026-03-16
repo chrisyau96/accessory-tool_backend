@@ -717,14 +717,16 @@ def _broad_match(query: str, candidate: str) -> bool:
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/api/healthz")
 def health():
-    return {
-        "ok": True,
-        "repo": DATA_REPO,
-        "data_path": DATA_PATH,
-        "sheet": DATA_SHEET or "",
-        "cache_ttl_seconds": CACHE_TTL,
-        "allowed_origins": FRONTEND_ORIGINS,
-    }
+    try:
+        df = load_df()
+        return {
+            "ok": True,
+            "sheet": DATA_SHEET or "",
+            "row_count": len(df),
+            "sample_items": df["Item_str"].head(5).tolist() if "Item_str" in df.columns else [],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "sheet": DATA_SHEET or ""}, 500
 
 
 @limiter.limit(os.getenv("RATE_LIMIT_META", "30/minute;1000/day"))
