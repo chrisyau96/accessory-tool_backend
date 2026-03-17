@@ -68,6 +68,18 @@ def _get_series(row, *names):
     return None
 
 
+def _tokenize_search_text(s: str) -> list[str]:
+    return [
+        t
+        for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower())
+        if t
+    ]
+
+
+def _compact_search_text(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", "", (s or "").lower())
+
+
 # ── Config ───────────────────────────────────────────────────────────────────
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 DATA_REPO = os.getenv("DATA_REPO", "chrisyau96/core-accessory-tool-data").strip()
@@ -135,7 +147,6 @@ def _origin_allowed() -> bool:
     if ref:
         return _normalize_origin(ref) in ALLOWED_ORIGINS
 
-    # Allow clients that do not send Origin / Referer
     return True
 
 
@@ -207,7 +218,6 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     _ensure_minimum_columns(df)
 
-    # Required filtering rules
     bundle_type = _clean_text_series(df["BUNDLE_TYPE"]).str.lower()
     df = df[bundle_type == "consumable"].copy()
 
@@ -382,6 +392,14 @@ def _display_name(brand, product, lang: str) -> str:
     return f"{b} {p}".strip()
 
 
+def _display_name_for_lang(row_like, lang: str) -> str:
+    brand_col = LANG_BRAND_MAP.get(lang)
+    product_col = LANG_PRODUCT_MAP.get(lang)
+    brand = _safe_str(row_like.get(brand_col)).strip() if hasattr(row_like, "get") else ""
+    product = _safe_str(row_like.get(product_col)).strip() if hasattr(row_like, "get") else ""
+    return _display_name(brand, product, lang).strip()
+
+
 def _brand_for_display(brand, lang: str) -> str:
     b = _safe_str(brand).strip()
     return _cap_words_en(b) if lang == "en" else b
@@ -393,11 +411,7 @@ def _lang_order(preferred_lang: str):
 
 def _display_name_fallback(row_like, preferred_lang: str) -> str:
     for lang in _lang_order(preferred_lang):
-        brand_col = LANG_BRAND_MAP.get(lang)
-        product_col = LANG_PRODUCT_MAP.get(lang)
-        brand = _safe_str(row_like.get(brand_col)).strip() if hasattr(row_like, "get") else ""
-        product = _safe_str(row_like.get(product_col)).strip() if hasattr(row_like, "get") else ""
-        disp = _display_name(brand, product, lang).strip()
+        disp = _display_name_for_lang(row_like, lang)
         if disp:
             return disp
     return ""
@@ -436,13 +450,11 @@ def _dept_label(row_like, lang: str) -> str:
 def _normalize_type_value(v: str) -> str:
     x = (v or "").strip().upper()
 
-    # Standard type values
     if x in ("A", "ACCESSORY"):
         return "A"
     if x in ("C", "CORE", "CORE ITEM"):
         return "C"
 
-    # Fallback if only SHEET_NAME exists
     if "ACCESS" in x:
         return "A"
     if "CORE" in x:
@@ -530,13 +542,10 @@ def _select_cols(df_like, lang: str):
     product_col = LANG_PRODUCT_MAP[lang] if has(LANG_PRODUCT_MAP[lang]) else None
     item_col = "ITEM" if has("ITEM") else ("Item" if has("Item") else None)
     dept_col = "ITEM_DEPT_NAME" if has("ITEM_DEPT_NAME") else None
-
-    # ITEM_TYPE is preferred. If missing, use SHEET_NAME as a fallback.
     type_col = (
         "ITEM_TYPE" if has("ITEM_TYPE")
         else ("SHEET_NAME" if has("SHEET_NAME") else None)
     )
-
     bundle_col = "BUNDLE_ID" if has("BUNDLE_ID") else None
     allow_col = "ALLOW_TO_BUY" if has("ALLOW_TO_BUY") else ("Allow To Buy" if has("Allow To Buy") else None)
     rrp_col = "RRP" if has("RRP") else None
@@ -544,7 +553,7 @@ def _select_cols(df_like, lang: str):
     return brand_col, product_col, item_col, dept_col, type_col, bundle_col, allow_col, rrp_col
 
 
-# ── Matching / building ──────────────────────────────────────────────────────
+# ── Matching / scoring ───────────────────────────────────────────────────────
 def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -556,6 +565,149 @@ def _match_by_display_name(df: pd.DataFrame, name: str, lang: str) -> pd.DataFra
     tmp["_disp_key"] = tmp["_disp"].map(_normalize_display_text)
 
     return tmp[tmp["_disp_key"] == target]
+
+
+def _broad_match(query: str, candidate: str) -> bool:
+    q = (query or "").strip()
+    cand = (candidate or "").strip()
+
+    if not q or not cand:
+        return False
+
+    q_tokens = _tokenize_search_text(q)
+    q_compact = _compact_search_text(q)
+
+    cand_l = cand.lower()
+    cand_tokens = _tokenize_search_text(cand_l)
+    cand_compact = _compact_search_text(cand_l)
+
+    if not q_tokens:
+        return False
+
+    if q_compact and q_compact in cand_compact:
+        return True
+
+    for qt in q_tokens:
+        if qt in cand_l:
+            continue
+
+        qt_compact = _compact_search_text(qt)
+        if qt_compact and qt_compact in cand_compact:
+            continue
+
+        if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
+            continue
+
+        return False
+
+    return True
+
+
+def _score_candidate_value(query: str, candidate: str) -> int:
+    """
+    Higher score = stronger / more phrase-like match.
+    Keeps broad match flexibility, but ranks contiguous phrase matches much higher.
+    """
+    if not _broad_match(query, candidate):
+        return -1
+
+    q_raw = (query or "").strip().lower()
+    c_raw = (candidate or "").strip().lower()
+
+    q_norm = _normalize_display_text(query)
+    c_norm = _normalize_display_text(candidate)
+
+    q_tokens = _tokenize_search_text(query)
+    c_tokens = _tokenize_search_text(candidate)
+
+    q_compact = _compact_search_text(query)
+    c_compact = _compact_search_text(candidate)
+
+    score = 0
+
+    # Full / phrase match priority
+    if q_norm and c_norm == q_norm:
+        score += 2000
+    elif q_norm and c_norm.startswith(q_norm):
+        score += 1600
+    elif q_norm and q_norm in c_norm:
+        score += 1300
+
+    # Compact phrase match (handles spaces / punctuation differences)
+    if q_compact and c_compact == q_compact:
+        score += 1800
+    elif q_compact and c_compact.startswith(q_compact):
+        score += 1400
+    elif q_compact and q_compact in c_compact:
+        score += 1100
+
+    # Earlier occurrence is better
+    if q_compact and q_compact in c_compact:
+        idx = c_compact.find(q_compact)
+        score += max(0, 250 - min(idx, 250))
+
+    if q_raw and q_raw in c_raw:
+        idx2 = c_raw.find(q_raw)
+        score += max(0, 180 - min(idx2, 180))
+
+    # Token-level scoring
+    for qt in q_tokens:
+        if not qt:
+            continue
+
+        if any(ct == qt for ct in c_tokens):
+            score += 260
+        elif any(ct.startswith(qt) for ct in c_tokens):
+            score += 180
+        elif any(qt in ct for ct in c_tokens):
+            score += 120
+
+    # Shorter display strings with same match tend to be better
+    score += max(0, 80 - min(len(c_compact), 80))
+
+    return score
+
+
+def _row_suggest_score(row: pd.Series, query: str, lang: str) -> int:
+    """
+    Rank phrase matches in display / product names above SKU-only matches,
+    while still keeping broad match flexibility.
+    """
+    scores = []
+
+    def push(text: str, weight: int):
+        s = _score_candidate_value(query, text)
+        if s >= 0:
+            scores.append(weight + s)
+
+    # Highest priority: current-lang display name
+    display_current = _display_name_for_lang(row, lang)
+    if display_current:
+        push(display_current, 5000)
+
+    # Fallback display name
+    display_fallback = _display_name_fallback(row, lang)
+    if display_fallback and _normalize_display_text(display_fallback) != _normalize_display_text(display_current):
+        push(display_fallback, 4600)
+
+    # Current language product / brand
+    brand_col = LANG_BRAND_MAP.get(lang)
+    product_col = LANG_PRODUCT_MAP.get(lang)
+    push(_safe_str(row.get(product_col, "")).strip(), 4200)
+    push(_safe_str(row.get(brand_col, "")).strip(), 3000)
+
+    # Other languages still searchable, but rank lower
+    for other_lang in ALL_LANGS:
+        if other_lang == lang:
+            continue
+        push(_display_name_for_lang(row, other_lang), 2600)
+        push(_safe_str(row.get(LANG_PRODUCT_MAP[other_lang], "")).strip(), 2200)
+        push(_safe_str(row.get(LANG_BRAND_MAP[other_lang], "")).strip(), 1500)
+
+    # SKU stays broad-matchable, but lower than name / display matches
+    push(_safe_str(row.get("Item_str", "")).strip(), 900)
+
+    return max(scores) if scores else -1
 
 
 def _row_to_result(row: pd.Series, lang: str) -> dict:
@@ -610,8 +762,6 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
     row_item = _safe_str(row.get("Item_str")).strip()
     row_bundle = row.get(bundle_col)
 
-    # If type exists, return opposite-side items in same bundle.
-    # If type does not exist, return all other items in same bundle.
     rel = df[df[bundle_col] == row_bundle].copy()
 
     if type_col and type_col in df.columns:
@@ -664,54 +814,6 @@ def _related_items(df: pd.DataFrame, row: pd.Series, lang: str):
         })
 
     return out
-
-
-def _tokenize_search_text(s: str) -> list[str]:
-    return [
-        t
-        for t in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", (s or "").lower())
-        if t
-    ]
-
-
-def _compact_search_text(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", "", (s or "").lower())
-
-
-def _broad_match(query: str, candidate: str) -> bool:
-    q = (query or "").strip()
-    cand = (candidate or "").strip()
-
-    if not q or not cand:
-        return False
-
-    q_tokens = _tokenize_search_text(q)
-    q_compact = _compact_search_text(q)
-
-    cand_l = cand.lower()
-    cand_tokens = _tokenize_search_text(cand_l)
-    cand_compact = _compact_search_text(cand_l)
-
-    if not q_tokens:
-        return False
-
-    if q_compact and q_compact in cand_compact:
-        return True
-
-    for qt in q_tokens:
-        if qt in cand_l:
-            continue
-
-        qt_compact = _compact_search_text(qt)
-        if qt_compact and qt_compact in cand_compact:
-            continue
-
-        if any(ct.startswith(qt) or qt in ct for ct in cand_tokens):
-            continue
-
-        return False
-
-    return True
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -849,31 +951,31 @@ def api_suggest():
     if filtered.empty:
         return jsonify({"suggestions": []})
 
-    suggestions = []
-    seen = set()
-    q_digits = re.sub(r"\D", "", q)
+    ranked = {}
 
     for _, row in filtered.iterrows():
         out = _display_name_fallback(row, lang).strip()
         if not out:
             continue
 
-        out_key = _normalize_display_text(out)
-        if out_key in seen:
+        score = _row_suggest_score(row, q, lang)
+        if score < 0:
             continue
 
-        search_values = _collect_search_values(row)
-        matched = any(_broad_match(q, v) for v in search_values)
+        out_key = _normalize_display_text(out)
+        prev = ranked.get(out_key)
 
-        if not matched and q_digits:
-            item_str = _safe_str(row.get("Item_str")).strip()
-            matched = bool(item_str and q_digits in item_str)
+        if prev is None or score > prev["score"]:
+            ranked[out_key] = {"score": score, "text": out}
 
-        if matched:
-            seen.add(out_key)
-            suggestions.append(out)
+    suggestions = [
+        x["text"]
+        for x in sorted(
+            ranked.values(),
+            key=lambda x: (-x["score"], _normalize_display_text(x["text"]))
+        )
+    ][:MAX_SUGGESTIONS]
 
-    suggestions = sorted(suggestions)[:MAX_SUGGESTIONS]
     return jsonify({"suggestions": suggestions})
 
 
@@ -886,9 +988,9 @@ def api_search():
 
     try:
         df = load_df()
-    except Exception as e:
+    except Exception:
         logger.exception("api_search failed")
-        return jsonify({"error": "dataset unavailable", "details": str(e)}), 500
+        return jsonify({"error": "dataset unavailable"}), 500
 
     product_number = None
     error = None
